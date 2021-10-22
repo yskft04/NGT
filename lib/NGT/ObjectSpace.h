@@ -357,7 +357,9 @@ namespace NGT {
   class Object : public BaseObject {
   public:
     Object(NGT::ObjectSpace *os = 0):vector(0) {
-      assert(os != 0);
+      if (os == 0) {
+	return;
+      }
       size_t s = os->getByteSizeOfObject();
       construct(s);
     }
@@ -366,6 +368,9 @@ namespace NGT {
       assert(s != 0);
       construct(s);
     }
+
+    void attach(void *ptr) { vector = static_cast<uint8_t*>(ptr); }
+    void detach() { vector = 0; }
 
     void copy(Object &o, size_t s) {
       assert(vector != 0);

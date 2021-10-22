@@ -34,23 +34,25 @@ ngtpy(pybind11) can reduce the processing times than ngt(ctypes). It is more eff
   import ngtpy
   import random
 
-
   dim = 10
-  nb = 100
-  vectors = [[random.random() for _ in range(dim)] for _ in range(nb)]
-  query = vectors[0]
-  
+  objects = []
+  for i in range(0, 100) :
+      vector = random.sample(range(100), dim)
+      objects.append(vector)
+
+  query = objects[0]
+
   ngtpy.create(b"tmp", dim)
   index = ngtpy.Index(b"tmp")
-  index.batch_insert(vectors)
+  index.batch_insert(objects)
   index.save()
 
-  results = index.search(query, 3)
-  for i, (id, distance) in enumerate(results) :
-      print(str(i) + ": " + str(id) + ", " + str(distance))
-      object = index.get_object(id)
-      print(object)
+  result = index.search(query, 3)
 
+  for i, o in enumerate(result) :
+      print(str(i) + ": " + str(o[0]) + ", " + str(o[1]))
+      object = index.get_object(o[0])
+      print(object)
 ```
 
 See also [sample.py](https://github.com/yahoojapan/NGT/blob/master/python/sample/sample.py).
@@ -62,24 +64,25 @@ See also [sample.py](https://github.com/yahoojapan/NGT/blob/master/python/sample
   import random
 
   dim = 10
-  nb = 100
-  vectors = [[random.random() for _ in range(dim)] for _ in range(nb)]
-  query = vectors[0]
+  objects = []
+  for i in range(0, 100) :
+      vector = random.sample(range(100), dim)
+      objects.append(vector)
 
+  query = objects[0]
   index = ngt.Index.create(b"tmp", dim)
-  index.insert(vectors)
-  # You can also insert vectors from a file like this.
+  index.insert(objects)
+  # You can also insert objects from a file like this.
   # index.insert_from_tsv('list.tsv') 
 
   index.save()
   # You can load saved the index like this.
   # index = ngt.Index(b"tmp")
 
+  result = index.search(query, 3)
 
-  results = index.search(query, 3)
-  for i, result in enumerate(results) :
-      print(str(i) + ": " + str(result.id) + ", " + str(result.distance))
-      object = index.get_object(result.id)
+  for i, o in enumerate(result) :
+      print(str(i) + ": " + str(o.id) + ", " + str(o.distance))
+      object = index.get_object(o.id)
       print(object)
-      
 ```

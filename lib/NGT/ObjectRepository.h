@@ -192,7 +192,8 @@ namespace NGT {
       return (Object*)po;
     }
 
-    void extractObjectFromText(const std::string &textLine, const std::string &sep, std::vector<double> &object) {
+    template <typename T>
+      void extractObjectFromText(const std::string &textLine, const std::string &sep, std::vector<T> &object) {
       object.resize(dimension);
       std::vector<std::string> tokens;
       NGT::Common::tokenize(textLine, tokens, sep);
@@ -211,7 +212,7 @@ namespace NGT {
 	  NGTThrowException(msg);
         }
 	char *e;
-	object[idx] = strtod(tokens[idx].c_str(), &e);
+	object[idx] = static_cast<T>(strtod(tokens[idx].c_str(), &e));
 	if (*e != 0) {
 	  std::cerr << "ObjectSpace::readText: Warning! Not numerical value. [" << e << "]" << std::endl;
 	  break;

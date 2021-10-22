@@ -43,6 +43,7 @@ namespace NGTQG {
     ~QuantizedNode() {
       delete[] static_cast<uint8_t*>(objects);
     }
+    uint32_t subspaceID;
     std::vector<uint32_t> ids;
     void *objects;
   };
@@ -93,7 +94,6 @@ namespace NGTQG {
 	  (*this)[id].ids.push_back((*i).id);
 	  for (size_t idx = 0; idx < numOfSubspaces; idx++) {
 #ifdef NGT_SHARED_MEMORY_ALLOCATOR
-            size_t dataNo = distance(node.begin(graphRepository.allocator), i);  
 #else
             size_t dataNo = distance(node.begin(), i);  
 #endif
@@ -121,6 +121,8 @@ namespace NGTQG {
       n = PARENT::size();
       NGT::Serializer::write(os, n);
       for (auto i = PARENT::begin(); i != PARENT::end(); ++i) {
+        uint32_t sid = (*i).subspaceID;
+        NGT::Serializer::write(os, sid);      
 	NGT::Serializer::write(os, (*i).ids);
 	size_t streamSize = quantizedObjectProcessingStream.getUint4StreamSize((*i).ids.size());
 	NGT::Serializer::write(os, static_cast<uint8_t*>((*i).objects), streamSize);
@@ -136,6 +138,9 @@ namespace NGTQG {
 	NGT::Serializer::read(is, n);
 	PARENT::resize(n);
 	for (auto i = PARENT::begin(); i != PARENT::end(); ++i) {
+	  uint32_t sid;
+	  NGT::Serializer::read(is, sid);
+	  (*i).subspaceID = sid;
 	  NGT::Serializer::read(is, (*i).ids);
           size_t streamSize = quantizedObjectProcessingStream.getUint4StreamSize((*i).ids.size());
 	  uint8_t *objectStream = new uint8_t[streamSize];
@@ -149,6 +154,12 @@ namespace NGTQG {
       }
     }
 
+    bool stat(const string &path) {
+      struct stat st;
+      const std::string p(path + "/grp");
+      return ::stat(p.c_str(), &st) == 0;
+    }
+    
     void save(const string &path) {
       const std::string p(path + "/grp");
       std::ofstream os(p);
@@ -167,10 +178,11 @@ namespace NGTQG {
 
   class Index : public NGT::Index {
   public:
-    Index(const std::string &indexPath, size_t maxNoOfEdges = 128) :
-      NGT::Index(indexPath, false),
+    Index(const std::string &indexPath, size_t maxNoOfEdges = 128, bool rdOnly = false) :
+      NGT::Index(indexPath, false, rdOnly),
+      readOnly(rdOnly),
       path(indexPath),
-      quantizedIndex(indexPath + "/qg"),
+      quantizedIndex(indexPath + "/qg", rdOnly),
       quantizedGraph(quantizedIndex)  
       {
 	{
@@ -179,6 +191,9 @@ namespace NGTQG {
 	  if (stat(qgpath.c_str(), &st) == 0) {
 	    quantizedGraph.load(path + "/qg");
 	  } else {
+	    if (readOnly) {
+	      std::cerr << "No quantized graph. Construct it temporarily." << std::endl;
+	    }
 	    quantizedGraph.construct(*this, quantizedIndex, maxNoOfEdges);
 	  }
 	}
@@ -333,7 +348,7 @@ namespace NGTQG {
 	return;
       }
       if (seeds.size() == 0) {
-	index.getSeedsFromGraph(index.repository, seeds);
+	index.getSeedsFromGraph(index.getObjectSpace().getRepository(), seeds);
       }
       if (sc.expectedAccuracy > 0.0) {
 	sc.setEpsilon(getEpsilonFromExpectedAccuracy(sc.expectedAccuracy));
@@ -359,7 +374,11 @@ namespace NGTQG {
         sc.distanceComputationCount = 0;
         sc.visitCount = 0;
 	NGT::ObjectDistances	seeds;
-	index.getSeedsFromTree(sc, seeds);
+	if (!readOnly) {
+	  try {
+	    index.getSeedsFromTree(sc, seeds);
+	  } catch (...) {}
+	}
 	NGTQG::Index::search(static_cast<NGT::GraphIndex&>(index), sc, seeds);
 	sq.workingResult = std::move(sc.workingResult);
 	sq.distanceComputationCount = sc.distanceComputationCount;
@@ -395,8 +414,8 @@ namespace NGTQG {
 
       {
 	std::vector<float> meanObject(objectSpace.getDimension(), 0);
-	quantizedIndex.getQuantizer().globalCodebook.insert(meanObject);
-	quantizedIndex.getQuantizer().globalCodebook.createIndex(8);
+	quantizedIndex.getQuantizer().globalCodebookIndex.insert(meanObject);
+	quantizedIndex.getQuantizer().globalCodebookIndex.createIndex(8);
       }
 
       vector<pair<NGT::Object*, size_t> > objects;
@@ -474,6 +493,7 @@ namespace NGTQG {
       }
     }
 
+    const bool readOnly;
     const std::string path;
     NGTQ::Index quantizedIndex;
     NGTQ::Index blobIndex;

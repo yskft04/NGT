@@ -16,13 +16,32 @@
 
 #pragma once
 
+
 #include	"NGT/Index.h"
 #include	"NGT/ArrayFile.h"
 #include	"NGT/Clustering.h"
+#include	<unordered_map>
 
+#define NGTQ_NEURIPS21
+#define MULTIPLE_OBJECT_LISTS
 
+#ifdef NGTQ_NEURIPS21
+#include	"NGT/NGTQ/ObjectFile.h"
+#endif
+
+#define NGTLQG_MIN
+
+#define NGTQ_LQBG
+#define NGTQG_ROTATION
+#define NGTQG_ROTATION_BLAS 
+#define NGTQG_ROTATED_GLOBAL_CODEBOOKS      
+#define NGTQ_REARRANGED_INVERTED_INDEX
+
+#define NGTQ_UINT8_LUT
 #define NGTQ_SIMD_BLOCK_SIZE	16	
 #define NGTQ_BATCH_SIZE		2	
+#define NGTQ_UINT4_OBJECT  
+#define NGTQ_TOTAL_SCALE_OFFSET_COMPRESSION 
 #define NGTQG_PREFETCH
 #if defined(NGT_AVX512)
 #define NGTQG_AVX512	
@@ -40,8 +59,219 @@
 #define		NGTQ_SHARED_INVERTED_INDEX	
 #endif
 
+extern "C" {
+  void sgemv_(char *trans, int *m, int *n,
+	      float *alpha, float *A, int *ldA, float *x, int *incx,
+	      float *beta , float *y, int *incy);
+}
+
 namespace NGTQ {
 
+#ifdef NGTQ_LQBG
+
+class Rotation : public std::vector<float> {
+  typedef std::vector<float> PARENT;
+ public:
+  Rotation& operator=(const std::vector<float> &r) {
+    PARENT::operator=(r);
+    dim = sqrt(PARENT::size());
+    if ((dim * dim) != PARENT::size()) {
+      std::cerr << "Rotation: Fatal inner error! Invalid data. " << dim * dim << ":" << PARENT::size() << std::endl;
+      abort();
+    }
+    return *this;
+  }
+  void mulBlas(float *a) {
+    char trans = 'N';
+    int m = dim;
+    float alpha = 1.0;
+    float *matrix = PARENT::data();
+    int incx = 1;
+    float beta = 0.0;
+    float *y = new float[dim];
+    int incy = 1;
+    sgemv_(&trans, &m, &m, &alpha, matrix, &m, a, &incx, &beta, y, &incy);
+    memcpy(a, y, sizeof(float) * dim);
+    delete[] y;
+  }
+  void mul(float *a) {
+    if (PARENT::size() == 0) {
+      return;
+    }
+
+#ifdef NGTQG_ROTATION_BLAS
+    mulBlas(a);
+#else
+    float *matrix = PARENT::data();
+    float vec[dim];
+    for (int c = 0; c < dim; c++) {
+      double sum = 0;
+      for (int p = 0; p < dim; p++) {
+	sum += a[p] * matrix[p * dim + c];
+      }
+      vec[c] = sum;
+    }
+    memcpy(a, vec, sizeof(float) * dim);
+#endif
+  }
+  void mul(std::vector<float> &a) {
+    if (a.size() != dim) {
+      std::cerr << "Fatal inner error! " << a.size() << ":" << dim << std::endl;
+      abort();
+    }
+    mul(a.data());
+  }
+  void serialize(std::ofstream &os) {
+    uint32_t v = PARENT::size();
+    NGT::Serializer::write(os, v);
+    os.write(reinterpret_cast<const char*>(PARENT::data()), static_cast<uint64_t>(PARENT::size()) * sizeof(float));
+  }
+
+  void deserialize(std::ifstream &is) {
+    uint32_t v;
+    NGT::Serializer::read(is, v);
+    PARENT::resize(v);
+    dim = sqrt(v);
+    if (dim * dim != v) {
+      std::cerr << "rotation::deserialize: Fatal inner error. Invalid data. " << dim << ":" << dim * dim << ":" << v << std::endl;
+      abort();
+    }
+
+    is.read(reinterpret_cast<char*>(PARENT::data()), PARENT::size() * sizeof(float));
+
+
+  }
+  uint32_t dim;
+};
+
+template <typename T>
+class QuantizationCodebook : public std::vector<T> {
+  typedef std::vector<T> PARENT;
+ public:
+  QuantizationCodebook(): dimension(0), paddedDimension(0), index(0) {}
+  QuantizationCodebook& operator=(const std::vector<std::vector<float>> &qc) {
+    if (qc.empty()) {
+      NGTThrowException("NGTQ::QuantizationCodebook::operator=: codebook is mepty.");
+    }
+    if (paddedDimension == 0) {
+      NGTThrowException("NGTQ::QuantizationCodebook::operator=: paddedDimension is unset.");
+    }
+    dimension = qc[0].size();
+    std::cerr << "dim=" << dimension << ":" << qc.size() << ":" << paddedDimension << std::endl;
+    PARENT::resize(paddedDimension * qc.size());
+    for (size_t i = 0; i < qc.size(); i++) {
+      if (qc[i].size() != dimension) {
+	std::stringstream msg;
+	msg << "NGTQ::QuantizationCodebook::operator=: paddedDimension is invalid. " << i << ":" << qc[i].size() << ":" << dimension;
+	NGTThrowException(msg);
+      }
+      memcpy(PARENT::data() + i * paddedDimension, qc[i].data(), dimension * sizeof(T));
+    }
+    buildIndex();
+    return *this;
+  }
+  ~QuantizationCodebook() { delete index;  }
+  void setPaddedDimension(size_t pd) { paddedDimension = pd; }
+  T at(size_t id, size_t dim) {
+    return *(PARENT::data() + id * paddedDimension + dim);
+  }
+  T *data(size_t id) {
+    return PARENT::data() + id * paddedDimension;
+  }
+  size_t size() { return PARENT::size() == 0 ? 0 : PARENT::size() / paddedDimension; }
+  void buildIndex() {
+    if (PARENT::size() == 0) {
+      return;
+    }
+    std::cerr << "QuantizationCodebook::buildIndex" << std::endl;
+    if (index != 0) {
+      std::cerr << "Quantization codebook: something wrong?" << std::endl;
+      delete index;
+    }
+    NGT::Property property;
+    property.dimension = dimension;
+    property.distanceType = NGT::Index::Property::DistanceType::DistanceTypeL2;
+    index = new NGT::Index(property);
+    size_t noOfCentroids = PARENT::size() / paddedDimension;
+    for (size_t idx = 0; idx < noOfCentroids; idx++) {
+      if (idx % 100000 == 0) {
+	std::cerr << "QuantizationCodebook::buildIndex procesed objects=" << idx << std::endl;
+      }
+      index->append(data(idx), 1);  
+    }
+    index->createIndex(50);
+  }
+  size_t search(NGT::Object &object) {
+    if (index == 0) {
+      std::cerr << "QuantizeationCodebook: Fatal Error! The index is not available." << std::endl;
+      abort();
+    }
+    NGT::ObjectDistances result;
+    NGT::SearchContainer sc(object);
+    sc.setResults(&result);
+    sc.setSize(10);
+    sc.radius = FLT_MAX;
+    sc.setEpsilon(0.1);
+    index->search(sc);
+    if (result.size() == 0) {
+      std::cerr << "QuantizeationCodebook: Fatal Error! Cannot search." << std::endl;
+      abort();
+    } else {
+      return result[0].id - 1;
+    }
+  }
+  size_t find(NGT::Object &object, NGT::ObjectSpace::Comparator &comparator) {
+    size_t noOfCentroids = PARENT::size() / paddedDimension;
+    auto mind = std::numeric_limits<float>::max();
+    size_t minidx = 0;
+    for (size_t idx = 0; idx < noOfCentroids; idx++) {
+      auto d = NGT::PrimitiveComparator::compareL2(static_cast<float*>(object.getPointer()), data(idx), paddedDimension);
+      //std::cerr << "pass d=" << d << std::endl;
+      if (mind > d) {
+	mind = d;
+	minidx = idx;
+	//std::cerr << "pass " << d << ":" << idx << ":" << noOfCentroids << std::endl;
+      }
+    }
+    return minidx;
+  }
+
+  void rotate(Rotation &r) {
+    size_t noOfCentroids = PARENT::size() / paddedDimension;
+    for (size_t idx = 0; idx < noOfCentroids; idx++) {
+      r.mul(data(idx));
+    }
+  }
+  
+  void serialize(std::ofstream &os) {
+    uint32_t v = PARENT::size();
+    NGT::Serializer::write(os, v);
+    v = dimension;
+    NGT::Serializer::write(os, v);
+    v = paddedDimension;
+    NGT::Serializer::write(os, v);
+    os.write(reinterpret_cast<const char*>(PARENT::data()), static_cast<uint64_t>(PARENT::size()) * sizeof(T));
+  }
+  
+  void deserialize(std::ifstream &is, bool readOnly) {
+    uint32_t v;
+    NGT::Serializer::read(is, v);
+    PARENT::resize(v);
+    NGT::Serializer::read(is, v);
+    dimension = v;
+    NGT::Serializer::read(is, v);
+    paddedDimension = v;
+    is.read(reinterpret_cast<char*>(PARENT::data()), PARENT::size() * sizeof(T));
+    if (!readOnly) {
+      buildIndex();
+    }
+  }
+  uint32_t dimension;
+  uint32_t paddedDimension;
+  NGT::Index *index;
+};
+#endif
+ 
 template <typename T>
 class InvertedIndexObject {
 public:
@@ -70,14 +300,22 @@ public:
 };
  
 template <typename T>
-class InvertedIndexEntry : public NGT::DynamicLengthVector<InvertedIndexObject<T> > {
-  typedef NGT::DynamicLengthVector<InvertedIndexObject<T>> PARENT;
+class InvertedIndexEntry : public NGT::DynamicLengthVector<InvertedIndexObject<T>> {
 public:
+  typedef NGT::DynamicLengthVector<InvertedIndexObject<T>> PARENT;
 #ifdef NGTQ_SHARED_INVERTED_INDEX
-  InvertedIndexEntry(size_t n, NGT::ObjectSpace *os = 0):numOfLocalIDs(n) {
+  InvertedIndexEntry(size_t n, NGT::ObjectSpace *os = 0):numOfLocalIDs(n)
+#ifdef NGTQ_LQBG
+    , subspaceID(std::numeric_limits<uint32_t>::max())
+#endif
+  {
     PARENT::elementSize = getSizeOfElement();
   }
-  InvertedIndexEntry(size_t n, SharedMemoryAllocator &allocator, NGT::ObjectSpace *os = 0):numOfLocalIDs(n) {
+  InvertedIndexEntry(size_t n, SharedMemoryAllocator &allocator, NGT::ObjectSpace *os = 0):numOfLocalIDs(n)
+#ifdef NGTQ_LQBG
+    , subspaceID(std::numeric_limits<uint32_t>::max())
+#endif
+  {
     PARENT::elementSize = getSizeOfElement();
   }
   void pushBack(SharedMemoryAllocator &allocator) { 
@@ -89,8 +327,16 @@ public:
     PARENT::back(allocator).setID(id);
   }
 #else // NGTQ_SHARED_INVERTED_INDEX
-  InvertedIndexEntry(NGT::ObjectSpace *os = 0):numOfLocalIDs(0) {}
-  InvertedIndexEntry(size_t n, NGT::ObjectSpace *os = 0):numOfLocalIDs(n) {
+  InvertedIndexEntry(NGT::ObjectSpace *os = 0):numOfLocalIDs(0)
+#ifdef NGTQ_LQBG
+    , subspaceID(std::numeric_limits<uint32_t>::max())
+#endif
+  {}
+  InvertedIndexEntry(size_t n, NGT::ObjectSpace *os = 0):numOfLocalIDs(n)
+#ifdef NGTQ_LQBG
+    , subspaceID(std::numeric_limits<uint32_t>::max())
+#endif
+  {
     PARENT::elementSize = getSizeOfElement();
   }
   void pushBack() { 
@@ -111,22 +357,36 @@ public:
     }
     uint16_t nids = numOfLocalIDs;
     NGT::Serializer::write(os, nids);
+#ifdef NGTQ_LQBG
+    int32_t ssid = subspaceID;
+    NGT::Serializer::write(os, ssid);
+#endif
     os.write(reinterpret_cast<char*>(PARENT::vector), PARENT::size() * PARENT::elementSize);
   }
 
   void deserialize(std::ifstream &is, NGT::ObjectSpace *objectspace = 0) {
     uint32_t sz;
     uint16_t nids;
+#ifdef NGTQ_LQBG
+    int32_t ssid;
+#endif
     try {
       NGT::Serializer::read(is, sz);
       NGT::Serializer::read(is, nids);
+#ifdef NGTQ_LQBG
+      NGT::Serializer::read(is, ssid);
+#endif
     } catch(NGT::Exception &err) {
       std::stringstream msg;
       msg << "InvertedIndexEntry::deserialize: It might be caused by inconsistency of the valuable type of the inverted index size. " << err.what();
       NGTThrowException(msg);
     }
     numOfLocalIDs = nids;
+#ifdef NGTQ_LQBG
+    subspaceID = ssid;
+#endif
     PARENT::elementSize = getSizeOfElement();
+    PARENT::reserve(sz); 
     PARENT::resize(sz);
     is.read(reinterpret_cast<char*>(PARENT::vector), sz * PARENT::elementSize);
   }
@@ -139,15 +399,25 @@ public:
     return InvertedIndexObject<T>::headerSize() + dsize;
   }
 
-  size_t numOfLocalIDs;
+  uint32_t numOfLocalIDs;
+#ifdef NGTQ_LQBG
+  uint32_t subspaceID;
+#endif
 };
 
 class LocalDatam {
 public:
   LocalDatam(){};
-  LocalDatam(size_t iii, size_t iil) : iiIdx(iii), iiLocalIdx(iil) {}
+#ifdef NGTQ_LQBG
+ LocalDatam(size_t iii, size_t iil, uint32_t ssID = 0) : iiIdx(iii), iiLocalIdx(iil), subspaceID(ssID) {}
+#else
+ LocalDatam(size_t iii, size_t iil) : iiIdx(iii), iiLocalIdx(iil) {}
+#endif
   size_t iiIdx;	
   size_t iiLocalIdx; 
+#ifdef NGTQ_LQBG
+  uint32_t subspaceID;
+#endif
 };
 
 template <typename TYPE, int SIZE>
@@ -168,13 +438,16 @@ public:
    DistanceTypeHamming		= 3,
    DistanceTypeAngle		= 4,
    DistanceTypeNormalizedCosine	= 5,
-   DistanceTypeNormalizedL2	= 6
+   DistanceTypeNormalizedL2	= 6,
+   DistanceTypeCosine		= 7	
  };
 
  enum CentroidCreationMode {
    CentroidCreationModeDynamic		= 0,
    CentroidCreationModeStatic		= 1,
    CentroidCreationModeDynamicKmeans	= 2,
+   CentroidCreationModeStaticLayer	= 3,
+   CentroidCreationModeNone		= 9	
  };
 
  enum AggregationMode {
@@ -185,6 +458,12 @@ public:
    AggregationModeExactDistance					= 4
  };
 
+ enum QuantizerType {
+   QuantizerTypeNone	= 0,
+   QuantizerTypeQG	= 1,
+   QuantizerTypeLQG	= 2
+ };
+ 
  class Property {
  public:
   Property() {
@@ -206,6 +485,7 @@ public:
     localIDByteSize	= 0;		// finally decided by localCentroidLimit
     localCodebookState	= false;	// not completed
     localClusteringSampleCoefficient = 10;	
+    quantizerType	= QuantizerTypeNone;
 #ifdef NGT_SHARED_MEMORY_ALLOCATOR
     invertedIndexSharedMemorySize = 512; // MB
 #endif
@@ -230,6 +510,7 @@ public:
     prop.set("LocalIDByteSize",	(long)localIDByteSize);	
     prop.set("LocalCodebookState", (long)localCodebookState);
     prop.set("LocalSampleCoefficient", (long)localClusteringSampleCoefficient);
+    prop.set("QuantizerType",	(long)quantizerType);
 #ifdef NGT_SHARED_MEMORY_ALLOCATOR
     prop.set("InvertedIndexSharedMemorySize", 	(long)invertedIndexSharedMemorySize);
 #endif
@@ -250,7 +531,11 @@ public:
       } else {
       }
     }
+#ifdef NGTQ_LQBG
+    if (localIDByteSize != 1 && localIDByteSize != 2 && localIDByteSize != 4) {
+#else
     if (localIDByteSize != 2 && localIDByteSize != 4) {
+#endif
       NGTThrowException("NGTQ::Property: Fatal internal error! localIDByteSize should be 2 or 4.");
     }
   }
@@ -276,6 +561,7 @@ public:
     localCodebookState	= prop.getl("LocalCodebookState", localCodebookState);
     localClusteringSampleCoefficient	= prop.getl("LocalSampleCoefficient", localClusteringSampleCoefficient);
     setupLocalIDByteSize();
+    quantizerType	= (QuantizerType)prop.getl("QuantizerType", quantizerType);
 #ifdef NGT_SHARED_MEMORY_ALLOCATOR
     invertedIndexSharedMemorySize
       = prop.getl("InvertedIndexSharedMemorySize", invertedIndexSharedMemorySize);
@@ -297,6 +583,7 @@ public:
     localIDByteSize	= p.localIDByteSize;
     localCodebookState	= p.localCodebookState;
     localClusteringSampleCoefficient = p.localClusteringSampleCoefficient;
+    quantizerType	= p.quantizerType;
 #ifdef NGT_SHARED_MEMORY_ALLOCATOR
     invertedIndexSharedMemorySize = p.invertedIndexSharedMemorySize;
 #endif
@@ -321,6 +608,7 @@ public:
   size_t	localIDByteSize;
   bool		localCodebookState;
   size_t	localClusteringSampleCoefficient;
+  QuantizerType	quantizerType;
 #ifdef NGT_SHARED_MEMORY_ALLOCATOR
   size_t	invertedIndexSharedMemorySize;
 #endif
@@ -348,9 +636,20 @@ public:
 	localDistanceLookup = 0;
       }
     }
-    bool isValid(size_t idx) { return flag[idx]; }
+    bool isValid(size_t idx) { 
+#ifdef NGTQ_LQBG
+      abort();
+#else
+      return flag[idx]; 
+#endif
+    }
 #ifndef NGTQ_DISTANCE_ANGLE
-    void set(size_t idx, double d) { flag[idx] = true; localDistanceLookup[idx] = d; }
+    void set(size_t idx, double d) { 
+#ifndef NGTQ_LQBG
+      flag[idx] = true;
+#endif
+      localDistanceLookup[idx] = d; 
+    }
     double getDistance(size_t idx) { return localDistanceLookup[idx]; }
 #endif
     void initialize(size_t s) {
@@ -360,7 +659,9 @@ public:
 #else
       localDistanceLookup = new float[size];
 #endif
+#ifndef NGTQ_LQBG
       flag.resize(size, false);
+#endif
     }
 #ifdef NGTQ_DISTANCE_ANGLE
     LocalDistanceLookup	*localDistanceLookup;
@@ -368,7 +669,9 @@ public:
     float		*localDistanceLookup;
 #endif
     size_t		size;
+#ifndef NGTQ_LQBG
     vector<bool>	flag;	
+#endif
   };
 
   class DistanceLookupTableUint8 {
@@ -383,11 +686,13 @@ public:
       }
     }
     void initialize(size_t numOfSubspaces, size_t localCodebookCentroidNo) {
-      size_t alignedNumOfSubvectors = ((numOfSubspaces - 1) / NGTQ_BATCH_SIZE + 1) * NGTQ_BATCH_SIZE;
-      size = alignedNumOfSubvectors * localCodebookCentroidNo;
+      size_t numOfAlignedSubvectors = ((numOfSubspaces - 1) / NGTQ_BATCH_SIZE + 1) * NGTQ_BATCH_SIZE;
+      size = numOfAlignedSubvectors * localCodebookCentroidNo;
       localDistanceLookup = new uint8_t[size];
-      scales = new float[alignedNumOfSubvectors];
-      offsets = new float[alignedNumOfSubvectors];
+      scales = new float[numOfAlignedSubvectors];
+      offsets = new float[numOfAlignedSubvectors];
+      range512 = (numOfSubspaces >> 2) * step512;
+      range256 = (((numOfSubspaces - 1) >> 1) + 1) * step256;
     }
 
     uint8_t		*localDistanceLookup;
@@ -397,29 +702,37 @@ public:
     float		*scales;
     float		*offsets;
     float		totalOffset;
+    size_t		range512;
+    size_t		range256;
+    static constexpr size_t		step512 = 32;
+    static constexpr size_t		step256 = 16;
   };
 
   QuantizedObjectDistance(){}
   virtual ~QuantizedObjectDistance() {
     delete[] localCentroids;
+    delete[] localCentroidsForSIMD;
   }
 
   virtual double operator()(NGT::Object &object, size_t objectID, void *localID) = 0;
 
   virtual double operator()(void *localID, DistanceLookupTable &distanceLUT) = 0;
 
+#ifdef NGTLQG_MIN
+  virtual float operator()(void *inv, float *distances, size_t size, DistanceLookupTableUint8 &distanceLUT) = 0;
+#else
   virtual void operator()(void *inv, float *distances, size_t size, DistanceLookupTableUint8 &distanceLUT) = 0;
-
+#endif
   virtual double operator()(NGT::Object &object, size_t objectID, void *localID, DistanceLookupTable &distanceLUT) = 0;
 
   template <typename T>
   inline double getAngleDistanceUint8(NGT::Object &object, size_t objectID, T localID[]) {
-    assert(globalCodebook != 0);
-    NGT::PersistentObject &gcentroid = *globalCodebook->getObjectSpace().getRepository().get(objectID);
-    size_t sizeOfObject = globalCodebook->getObjectSpace().getByteSizeOfObject();
+    assert(globalCodebookIndex != 0);
+    NGT::PersistentObject &gcentroid = *globalCodebookIndex->getObjectSpace().getRepository().get(objectID);
+    size_t sizeOfObject = globalCodebookIndex->getObjectSpace().getByteSizeOfObject();
     size_t localDataSize = sizeOfObject / localDivisionNo / sizeof(uint8_t);
 #if defined(NGT_SHARED_MEMORY_ALLOCATOR)
-    unsigned char *gcptr = &gcentroid.at(0, globalCodebook->getObjectSpace().getRepository().allocator);
+    unsigned char *gcptr = &gcentroid.at(0, globalCodebookIndex->getObjectSpace().getRepository().allocator);
 #else
     unsigned char *gcptr = &gcentroid[0];
 #endif
@@ -429,9 +742,9 @@ public:
     double sum = 0.0F;
     for (size_t li = 0; li < localDivisionNo; li++) {
       size_t idx = localCodebookNo == 1 ? 0 : li;
-      NGT::PersistentObject &lcentroid = *localCodebook[idx].getObjectSpace().getRepository().get(localID[li]);
+      NGT::PersistentObject &lcentroid = *localCodebookIndexes[idx].getObjectSpace().getRepository().get(localID[li]);
 #if defined(NGT_SHARED_MEMORY_ALLOCATOR)
-      float *lcptr = (float*)&lcentroid.at(0, localCodebook[idx].getObjectSpace().getRepository().allocator);
+      float *lcptr = (float*)&lcentroid.at(0, localCodebookIndexes[idx].getObjectSpace().getRepository().allocator);
 #else
       float *lcptr = (float*)&lcentroid[0];
 #endif
@@ -456,12 +769,12 @@ public:
 #if defined(NGT_NO_AVX)
   template <typename T>
   inline double getL2DistanceUint8(NGT::Object &object, size_t objectID, T localID[]) {
-    assert(globalCodebook != 0);
-    NGT::PersistentObject &gcentroid = *globalCodebook->getObjectSpace().getRepository().get(objectID);
-    size_t sizeOfObject = globalCodebook->getObjectSpace().getByteSizeOfObject();
+    assert(globalCodebookIndex != 0);
+    NGT::PersistentObject &gcentroid = *globalCodebookIndex->getObjectSpace().getRepository().get(objectID);
+    size_t sizeOfObject = globalCodebookIndex->getObjectSpace().getByteSizeOfObject();
     size_t localDataSize = sizeOfObject / localDivisionNo / sizeof(uint8_t);
 #if defined(NGT_SHARED_MEMORY_ALLOCATOR)
-    unsigned char *gcptr = &gcentroid.at(0, globalCodebook->getObjectSpace().getRepository().allocator);
+    unsigned char *gcptr = &gcentroid.at(0, globalCodebookIndex->getObjectSpace().getRepository().allocator);
 #else
     unsigned char *gcptr = &gcentroid[0];
 #endif
@@ -469,9 +782,9 @@ public:
     double distance = 0.0;
     for (size_t li = 0; li < localDivisionNo; li++) {
       size_t idx = localCodebookNo == 1 ? 0 : li;
-      NGT::PersistentObject &lcentroid = *localCodebook[idx].getObjectSpace().getRepository().get(localID[li]);
+      NGT::PersistentObject &lcentroid = *localCodebookIndexes[idx].getObjectSpace().getRepository().get(localID[li]);
 #if defined(NGT_SHARED_MEMORY_ALLOCATOR)
-      float *lcptr = (float*)&lcentroid.at(0, localCodebook[idx].getObjectSpace().getRepository().allocator);
+      float *lcptr = (float*)&lcentroid.at(0, localCodebookIndexes[idx].getObjectSpace().getRepository().allocator);
 #else
       float *lcptr = (float*)&lcentroid[0];
 #endif
@@ -488,12 +801,12 @@ public:
 #else 
   template <typename T>
   inline double getL2DistanceUint8(NGT::Object &object, size_t objectID, T localID[]) {
-    assert(globalCodebook != 0);
-    NGT::PersistentObject &gcentroid = *globalCodebook->getObjectSpace().getRepository().get(objectID);
-    size_t sizeOfObject = globalCodebook->getObjectSpace().getByteSizeOfObject();
+    assert(globalCodebookIndex != 0);
+    NGT::PersistentObject &gcentroid = *globalCodebookIndex->getObjectSpace().getRepository().get(objectID);
+    size_t sizeOfObject = globalCodebookIndex->getObjectSpace().getByteSizeOfObject();
     size_t localDataSize = sizeOfObject / localDivisionNo / sizeof(uint8_t);
 #if defined(NGT_SHARED_MEMORY_ALLOCATOR)
-    unsigned char *gcptr = &gcentroid.at(0, globalCodebook->getObjectSpace().getRepository().allocator);
+    unsigned char *gcptr = &gcentroid.at(0, globalCodebookIndex->getObjectSpace().getRepository().allocator);
 #else
     unsigned char *gcptr = &gcentroid[0];
 #endif
@@ -501,9 +814,9 @@ public:
     double distance = 0.0;
     for (size_t li = 0; li < localDivisionNo; li++) {
       size_t idx = localCodebookNo == 1 ? 0 : li;
-      NGT::PersistentObject &lcentroid = *localCodebook[idx].getObjectSpace().getRepository().get(localID[li]);
+      NGT::PersistentObject &lcentroid = *localCodebookIndexes[idx].getObjectSpace().getRepository().get(localID[li]);
 #if defined(NGT_SHARED_MEMORY_ALLOCATOR)
-      float *lcptr = (float*)&lcentroid.at(0, localCodebook[idx].getObjectSpace().getRepository().allocator);
+      float *lcptr = (float*)&lcentroid.at(0, localCodebookIndexes[idx].getObjectSpace().getRepository().allocator);
 #else
       float *lcptr = (float*)&lcentroid[0];
 #endif
@@ -536,12 +849,12 @@ public:
 
   template <typename T>
   inline double getAngleDistanceFloat(NGT::Object &object, size_t objectID, T localID[]) {
-    assert(globalCodebook != 0);
-    NGT::PersistentObject &gcentroid = *globalCodebook->getObjectSpace().getRepository().get(objectID);
-    size_t sizeOfObject = globalCodebook->getObjectSpace().getByteSizeOfObject();
+    assert(globalCodebookIndex != 0);
+    NGT::PersistentObject &gcentroid = *globalCodebookIndex->getObjectSpace().getRepository().get(objectID);
+    size_t sizeOfObject = globalCodebookIndex->getObjectSpace().getByteSizeOfObject();
     size_t localDataSize = sizeOfObject / localDivisionNo  / sizeof(float);
 #if defined(NGT_SHARED_MEMORY_ALLOCATOR)
-    float *gcptr = (float*)&gcentroid.at(0, globalCodebook->getObjectSpace().getRepository().allocator);
+    float *gcptr = (float*)&gcentroid.at(0, globalCodebookIndex->getObjectSpace().getRepository().allocator);
 #else
     float *gcptr = (float*)&gcentroid[0];
 #endif
@@ -551,9 +864,9 @@ public:
     double sum = 0.0F;
     for (size_t li = 0; li < localDivisionNo; li++) {
       size_t idx = localCodebookNo == 1 ? 0 : li;
-      NGT::PersistentObject &lcentroid = *localCodebook[idx].getObjectSpace().getRepository().get(localID[li]);
+      NGT::PersistentObject &lcentroid = *localCodebookIndexes[idx].getObjectSpace().getRepository().get(localID[li]);
 #if defined(NGT_SHARED_MEMORY_ALLOCATOR)
-      float *lcptr = (float*)&lcentroid.at(0, localCodebook[idx].getObjectSpace().getRepository().allocator);
+      float *lcptr = (float*)&lcentroid.at(0, localCodebookIndexes[idx].getObjectSpace().getRepository().allocator);
 #else
       float *lcptr = (float*)&lcentroid[0];
 #endif
@@ -577,12 +890,12 @@ public:
 
   template <typename T>
     inline double getL2DistanceFloat(NGT::Object &object, size_t objectID, T localID[]) {
-    assert(globalCodebook != 0);
-    NGT::PersistentObject &gcentroid = *globalCodebook->getObjectSpace().getRepository().get(objectID);
-    size_t sizeOfObject = globalCodebook->getObjectSpace().getByteSizeOfObject();
+    assert(globalCodebookIndex != 0);
+    NGT::PersistentObject &gcentroid = *globalCodebookIndex->getObjectSpace().getRepository().get(objectID);
+    size_t sizeOfObject = globalCodebookIndex->getObjectSpace().getByteSizeOfObject();
     size_t localDataSize = sizeOfObject / localDivisionNo  / sizeof(float);
 #if defined(NGT_SHARED_MEMORY_ALLOCATOR)
-    float *gcptr = (float*)&gcentroid.at(0, globalCodebook->getObjectSpace().getRepository().allocator);
+    float *gcptr = (float*)&gcentroid.at(0, globalCodebookIndex->getObjectSpace().getRepository().allocator);
 #else
     float *gcptr = (float*)&gcentroid[0];
 #endif
@@ -590,9 +903,9 @@ public:
     double distance = 0.0;
     for (size_t li = 0; li < localDivisionNo; li++) {
       size_t idx = localCodebookNo == 1 ? 0 : li;
-      NGT::PersistentObject &lcentroid = *localCodebook[idx].getObjectSpace().getRepository().get(localID[li]);
+      NGT::PersistentObject &lcentroid = *localCodebookIndexes[idx].getObjectSpace().getRepository().get(localID[li]);
 #if defined(NGT_SHARED_MEMORY_ALLOCATOR)
-      float *lcptr = (float*)&lcentroid.at(0, localCodebook[idx].getObjectSpace().getRepository().allocator);
+      float *lcptr = (float*)&lcentroid.at(0, localCodebookIndexes[idx].getObjectSpace().getRepository().allocator);
 #else
       float *lcptr = (float*)&lcentroid[0];
 #endif
@@ -610,9 +923,9 @@ public:
 
 #ifdef NGTQ_DISTANCE_ANGLE
   inline void createDistanceLookup(NGT::Object &object, size_t objectID, DistanceLookupTable &distanceLUT) {
-    assert(globalCodebook != 0);
-    NGT::Object &gcentroid = (NGT::Object &)*globalCodebook->getObjectSpace().getRepository().get(objectID);
-    size_t sizeOfObject = globalCodebook->getObjectSpace().getByteSizeOfObject();
+    assert(globalCodebookIndex != 0);
+    NGT::Object &gcentroid = (NGT::Object &)*globalCodebookIndex->getObjectSpace().getRepository().get(objectID);
+    size_t sizeOfObject = globalCodebookIndex->getObjectSpace().getByteSizeOfObject();
     size_t localDataSize = sizeOfObject  / localDivisionNo / sizeof(float);
     float *optr = (float*)&((NGT::Object&)object)[0];
     float *gcptr = (float*)&gcentroid[0];
@@ -621,7 +934,7 @@ public:
     for (size_t li = 0; li < localCodebookNo; li++, oft += localDataSize) {
       dlu++;  
       for (size_t k = 1; k < localCodebookCentroidNo; k++) {
-	NGT::Object &lcentroid = (NGT::Object&)*localCodebook[li].getObjectSpace().getRepository().get(k);
+	NGT::Object &lcentroid = (NGT::Object&)*localCodebookIndexes[li].getObjectSpace().getRepository().get(k);
 	float *lcptr = (float*)&lcentroid[0];		
 	float *lcendptr = lcptr + localDataSize;	
 	float *toptr = optr + oft;
@@ -643,9 +956,9 @@ public:
   }
 #else 
   inline void createDistanceLookup(NGT::Object &object, size_t objectID, DistanceLookupTable &distanceLUT) {
-    assert(globalCodebook != 0);
-    NGT::Object &gcentroid = (NGT::Object &)*globalCodebook->getObjectSpace().getRepository().get(objectID);
-    size_t sizeOfObject = globalCodebook->getObjectSpace().getByteSizeOfObject();
+    assert(globalCodebookIndex != 0);
+    NGT::Object &gcentroid = (NGT::Object &)*globalCodebookIndex->getObjectSpace().getRepository().get(objectID);
+    size_t sizeOfObject = globalCodebookIndex->getObjectSpace().getByteSizeOfObject();
 
     createFloatL2DistanceLookup(&((NGT::Object&)object)[0], sizeOfObject, &gcentroid[0], distanceLUT.localDistanceLookup); 
 
@@ -680,16 +993,202 @@ public:
 
 
 
+  inline void createFloatL2DistanceLookup(void *object, size_t sizeOfObject, void *globalCentroid, DistanceLookupTableUint8 &distanceLUT) {
+    assert(localCodebookCentroidNoSIMD == 16);
+    size_t dim = sizeOfObject  / sizeof(float);
+    size_t localDim = dim  / localDivisionNo;
+#if defined(NGT_AVX512) 
+    __m512 flut[dim / 2];
+    __m512 *flutptr = &flut[0];
+    __m512 mmin = _mm512_set1_ps(std::numeric_limits<float>::max());
+    __m512 mmax = _mm512_set1_ps(-std::numeric_limits<float>::max());
+    auto *lcptr = static_cast<float*>(&localCentroidsForSIMD[0]);
+    auto *optr = static_cast<float*>(object);
+    auto *optrend = optr + dim;
+    auto *gcptr = static_cast<float*>(globalCentroid);
+    while (optr < optrend) {
+      auto *optrllast = optr + localDim;
+      float rsv = *optr++ - *gcptr++;
+      __m512 vtmp = _mm512_sub_ps(_mm512_set1_ps(rsv), _mm512_loadu_ps(lcptr));
+      __m512 v = _mm512_mul_ps(vtmp, vtmp);
+      lcptr += 16;
+      while (optr < optrllast) {
+	rsv = *optr++ - *gcptr++;
+	vtmp = _mm512_sub_ps(_mm512_set1_ps(rsv), _mm512_loadu_ps(lcptr));
+	v = _mm512_add_ps(v, _mm512_mul_ps(vtmp, vtmp));
+	lcptr += 16;
+      }
+      mmin = _mm512_min_ps(mmin, v);
+      mmax = _mm512_max_ps(mmax, v);
+      *flutptr = v;
+      flutptr++;
+    }
+    float min = _mm512_reduce_min_ps(mmin);
+    float max = _mm512_reduce_max_ps(mmax);
+    float offset = min;
+    float scale = (max - min) / 255.0;
+
+
+    distanceLUT.totalOffset = 0.0;
+    auto *blutptr = distanceLUT.localDistanceLookup;
+    flutptr = &flut[0];
+    for (size_t li = 0; li < localCodebookNo; li++) {
+      __m512 v = _mm512_div_ps(_mm512_sub_ps(*flutptr, _mm512_set1_ps(offset)), _mm512_set1_ps(scale));
+      __m512i b4v = _mm512_cvtps_epi32(_mm512_roundscale_ps(v, _MM_FROUND_TO_NEAREST_INT));
+      __m128i b = _mm512_cvtepi32_epi8(b4v);
+      _mm_storeu_si128((__m128i_u*)blutptr, b);
+      //_mm512_storeu_si512(blutptr, b4v);
+      //_mm512_storeu_ps(blutptr, v);
+      flutptr++;
+      blutptr += 16;
+      distanceLUT.offsets[li] = offset;
+      distanceLUT.scales[li] = scale;
+      distanceLUT.totalOffset += offset;
+    }
+    
+#elif defined(NGT_AVX2) 
+    __m256 flut[dim];
+    __m256 *flutptr = &flut[0];
+    __m256 mmin = _mm256_set1_ps(std::numeric_limits<float>::max());
+    __m256 mmax = _mm256_set1_ps(-std::numeric_limits<float>::max());
+    auto *lcptr = static_cast<float*>(&localCentroidsForSIMD[0]);
+    auto *optr = static_cast<float*>(object);
+    auto *optrend = optr + dim;
+    auto *gcptr = static_cast<float*>(globalCentroid);
+    while (optr < optrend) {
+      auto *optrllast = optr + localDim;
+      float rsv = *optr++ - *gcptr++;
+      __m256 vtmp = _mm256_sub_ps(_mm256_set1_ps(rsv), _mm256_loadu_ps(lcptr));
+      __m256 vt = _mm256_mul_ps(vtmp, vtmp);
+      lcptr += 8;
+      vtmp = _mm256_sub_ps(_mm256_set1_ps(rsv), _mm256_loadu_ps(lcptr));
+      __m256 vb = _mm256_mul_ps(vtmp, vtmp);
+      lcptr += 8;
+      while (optr < optrllast) {
+	rsv = *optr++ - *gcptr++;
+	vtmp = _mm256_sub_ps(_mm256_set1_ps(rsv), _mm256_loadu_ps(lcptr));
+	vt = _mm256_add_ps(vt, _mm256_mul_ps(vtmp, vtmp));
+	lcptr += 8;
+	vtmp = _mm256_sub_ps(_mm256_set1_ps(rsv), _mm256_loadu_ps(lcptr));
+	vb = _mm256_add_ps(vb, _mm256_mul_ps(vtmp, vtmp));
+	lcptr += 8;
+      }
+
+      mmin = _mm256_min_ps(mmin, vt);
+      mmax = _mm256_max_ps(mmax, vt);
+      *flutptr++ = vt;
+      mmin = _mm256_min_ps(mmin, vb);
+      mmax = _mm256_max_ps(mmax, vb);
+      *flutptr++ = vb;
+    }
+    float f[8];
+    _mm256_storeu_ps(f, mmin);
+    float min = f[0];
+    for (size_t i = 1; i < 8; i++) {
+      if (min > f[i]) min = f[i];
+    }
+    _mm256_storeu_ps(f, mmax);
+    float max = f[0];
+    for (size_t i = 1; i < 8; i++) {
+      if (max < f[i]) max = f[i];
+    }
+    float offset = min;
+    float scale = (max - min) / 255.0;
+
+
+    distanceLUT.totalOffset = 0.0;
+    //uint8_t blut[dim / 2 * localCodebookCentroidNoSIMD];
+    auto *blutptr = distanceLUT.localDistanceLookup;
+    flutptr = &flut[0];
+    for (size_t li = 0; li < localCodebookNo; li++) {
+      __m256 v = _mm256_div_ps(_mm256_sub_ps(*flutptr++, _mm256_set1_ps(offset)), _mm256_set1_ps(scale));
+      __m256i b4v = _mm256_cvtps_epi32(_mm256_round_ps(v, _MM_FROUND_TO_NEAREST_INT));
+      *blutptr++ = _mm256_extract_epi8(b4v, 0);
+      *blutptr++ = _mm256_extract_epi8(b4v, 4);
+      *blutptr++ = _mm256_extract_epi8(b4v, 8);
+      *blutptr++ = _mm256_extract_epi8(b4v, 12);
+      __m128i b = _mm256_extracti128_si256(b4v, 1);
+      *blutptr++ = _mm_extract_epi8(b, 0);
+      *blutptr++ = _mm_extract_epi8(b, 4);
+      *blutptr++ = _mm_extract_epi8(b, 8);
+      *blutptr++ = _mm_extract_epi8(b, 12);
+      v = _mm256_div_ps(_mm256_sub_ps(*flutptr++, _mm256_set1_ps(offset)), _mm256_set1_ps(scale));
+      b4v = _mm256_cvtps_epi32(_mm256_round_ps(v, _MM_FROUND_TO_NEAREST_INT));
+      *blutptr++ = _mm256_extract_epi8(b4v, 0);
+      *blutptr++ = _mm256_extract_epi8(b4v, 4);
+      *blutptr++ = _mm256_extract_epi8(b4v, 8);
+      *blutptr++ = _mm256_extract_epi8(b4v, 12);
+      b = _mm256_extracti128_si256(b4v, 1);
+      *blutptr++ = _mm_extract_epi8(b, 0);
+      *blutptr++ = _mm_extract_epi8(b, 4);
+      *blutptr++ = _mm_extract_epi8(b, 8);
+      *blutptr++ = _mm_extract_epi8(b, 12);
+      distanceLUT.offsets[li] = offset;
+      distanceLUT.scales[li] = scale;
+      distanceLUT.totalOffset += offset;
+    }
+    
+#else 
+    float flut[dim / 2 * localCodebookCentroidNoSIMD];
+    auto *flutptr = &flut[0];
+    auto min = std::numeric_limits<float>::max();
+    auto max = -std::numeric_limits<float>::max();
+    auto *lcptr = static_cast<float*>(&localCentroidsForSIMD[0]);
+    auto *optr = static_cast<float*>(object);
+    auto *gcptr = static_cast<float*>(globalCentroid);
+    float sub[localCodebookCentroidNoSIMD];
+    for (size_t d = 0; d < dim; d++) {
+      float rsv = optr[d] - *gcptr++;
+      for (size_t k = 0; k < localCodebookCentroidNoSIMD; k++) {
+	auto v = rsv - *lcptr++;
+	v *= v;
+	if (d % 2 == 0) {
+	  sub[k] = v;
+	} else {
+	  v += sub[k];
+	  if (v < min) {
+	    min = v;
+	  } else if (v > max) {
+	    max = v;
+	  }
+	  *flutptr++ = v;
+	}
+      }
+    }
+    float offset = min;
+    float scale = (max - min) / 255.0;
+
+    distanceLUT.totalOffset = 0.0;
+    auto *blutptr = distanceLUT.localDistanceLookup;
+    flutptr = &flut[0];
+    for (size_t li = 0; li < localCodebookNo; li++) {
+      for (size_t k = 0; k < localCodebookCentroidNoSIMD; k++) {
+	int32_t tmp = std::round((*flutptr - offset) / scale);
+	assert(tmp >= 0 && tmp <= 255);
+	*blutptr++ = static_cast<uint8_t>(tmp);
+	flutptr++;
+      }
+      distanceLUT.offsets[li] = offset;
+      distanceLUT.scales[li] = scale;
+      distanceLUT.totalOffset += offset;
+    }
+
+#endif 
+
+    
+
+  }
+
+
+    
   inline void createFloatL2DistanceLookup(void *object, size_t sizeOfObject, void *globalCentroid, float *lut) {
     size_t localDataSize = sizeOfObject  / localDivisionNo / sizeof(float);
-
     float *optr = static_cast<float*>(object);
     float *gcptr = static_cast<float*>(globalCentroid);
-
     size_t oft = 0;
     float *lcptr = static_cast<float*>(&localCentroids[0]);
     for (size_t li = 0; li < localCodebookNo; li++, oft += localDataSize) {
-      lut++;  
+      *lut++ = 0;  
       lcptr += localDataSize;
       for (size_t k = 1; k < localCodebookCentroidNo; k++) {
 	float *lcendptr = lcptr + localDataSize;	
@@ -697,86 +1196,61 @@ public:
 	float *tgcptr = gcptr + oft;
 	float d = 0.0;
 	while (lcptr != lcendptr) {
+#if defined(NGTQG_ZERO_GLOBAL)
+	  float sub = *toptr++ - *lcptr++;
+#else
 	  float sub = *toptr++ - *tgcptr++ - *lcptr++;
+#endif
 	  d += sub * sub;
 	}
 	*lut++ = d;
       }
     }
-  }
 
+
+  }
 
   inline void createDistanceLookup(NGT::Object &object, size_t objectID, DistanceLookupTableUint8 &distanceLUT) {
-    assert(globalCodebook != 0);
-    NGT::Object &gcentroid = (NGT::Object &)*globalCodebook->getObjectSpace().getRepository().get(objectID);
-    size_t sizeOfObject = globalCodebook->getObjectSpace().getByteSizeOfObject();
-
-    float dlutmp[distanceLUT.size];
+    assert(globalCodebookIndex != 0);
+    size_t sizeOfObject = dimension * sizeOfType;
 #ifdef NGTQG_DOT_PRODUCT
-    createFloatDotProductLookup(&((NGT::Object&)object)[0], sizeOfObject, &gcentroid[0], dlutmp);
+    std::cerr << "Not implemented." << std::endl;
+    abort();
 #else
-    createFloatL2DistanceLookup(&((NGT::Object&)object)[0], sizeOfObject, &gcentroid[0], dlutmp);
+    createFloatL2DistanceLookup(&((NGT::Object&)object)[0], sizeOfObject, quantizationCodebook->data(objectID), distanceLUT);
 #endif
-    {
-      uint8_t *cdlu = distanceLUT.localDistanceLookup;
-      float *dlu = dlutmp;
-      distanceLUT.totalOffset = 0.0;
-      float min = FLT_MAX;
-      float max = -FLT_MAX;
-      for (size_t li = 0; li < localCodebookNo; li++) {    
-	for (size_t k = 1; k < localCodebookCentroidNo; k++) {
-	  if (dlu[k] > max) {
-	    max = dlu[k];
-	  }
-	  if (dlu[k] < min) {
-	    min = dlu[k];
-	  }
-	}
-	dlu += localCodebookCentroidNo;
-      }
-      float offset = min;
-      float scale = (max - min) / 255.0;
-      dlu = dlutmp;
-      for (size_t li = 0; li < localCodebookNo; li++) {
-	for (size_t k = 1; k < localCodebookCentroidNo; k++) {
-	  int32_t tmp = std::round((dlu[k] - offset) / scale);
-	  assert(tmp >= 0 && tmp <= 255);
-	  *cdlu++ = static_cast<uint8_t>(tmp);
-	}
-	dlu += localCodebookCentroidNo;
-	distanceLUT.offsets[li] = offset;
-	distanceLUT.scales[li] = scale;
-	distanceLUT.totalOffset += offset;
-      }
-      if ((localCodebookNo & 0x1) != 0) {
-	for (size_t k = 0; k < localCodebookCentroidNo; k++) {
-	  *cdlu++ = 0;
-        }
-	distanceLUT.offsets[localCodebookNo] = 0.0;
-	distanceLUT.scales[localCodebookNo] = 0.0;
-      }
-
-    }
   }
 
-  void set(NGT::Index *gcb, NGT::Index lcb[], size_t dn, size_t lcn, size_t sizeoftype, size_t dimension) {
-    globalCodebook = gcb;
-    localCodebook = lcb;
+  void set(NGT::Index *gcb, NGT::Index lcb[], QuantizationCodebook<float> *qcodebook, size_t dn, size_t lcn,
+	   size_t sizeoftype, size_t dim, Rotation *r) {
+    globalCodebookIndex = gcb;
+    localCodebookIndexes = lcb;
     localDivisionNo = dn;
+    dimension = dim;
     assert(dimension % localDivisionNo == 0);
     localDataSize = dimension / localDivisionNo;
     sizeOfType = sizeoftype;
     set(lcb, lcn);
+    if (globalCodebookIndex->getObjectSpace().getRepository().size() == 2) {
+      NGT::ObjectID id = 1;
+      try {
+	globalCodebookIndex->getObjectSpace().getObject(id, globalCentroid);
+      } catch (NGT::Exception &err) {
+	std::cerr << "Cannot load the global centroid. id=" << id << std::endl;
+      }
+    }
+
+    quantizationCodebook = qcodebook;
 
     float *lc = new float[localCodebookNo * localCodebookCentroidNo * localDataSize];
     for (size_t li = 0; li < localCodebookNo; li++) {
       for (size_t k = 1; k < localCodebookCentroidNo; k++) {
 #if defined(NGT_SHARED_MEMORY_ALLOCATOR)
-	NGT::PersistentObject &lcentroid = *static_cast<NGT::PersistentObject*>(localCodebook[li].getObjectSpace().getRepository().get(k));
+	NGT::PersistentObject &lcentroid = *static_cast<NGT::PersistentObject*>(localCodebookIndexes[li].getObjectSpace().getRepository().get(k));
 	memcpy(&lc[li * localCodebookCentroidNo * localDataSize + k * localDataSize],
-	       &lcentroid.at(0, localCodebook[li].getObjectSpace().getRepository().allocator), localDataSize * sizeof(float));
+	       &lcentroid.at(0, localCodebookIndexes[li].getObjectSpace().getRepository().allocator), localDataSize * sizeof(float));
 #else
-	NGT::Object &lcentroid = *static_cast<NGT::Object*>(localCodebook[li].getObjectSpace().getRepository().get(k));
+	NGT::Object &lcentroid = *static_cast<NGT::Object*>(localCodebookIndexes[li].getObjectSpace().getRepository().get(k));
 	memcpy(&lc[li * localCodebookCentroidNo * localDataSize + k * localDataSize], &lcentroid[0], localDataSize * sizeof(float));
 #endif
       }
@@ -784,6 +1258,26 @@ public:
 
     localCentroids = lc;
 
+    rotation = r;
+
+    localCodebookCentroidNoSIMD = localCodebookCentroidNo == 0 ? 0 : localCodebookCentroidNo - 1;
+    lc = new float[dimension * localCodebookCentroidNoSIMD];
+    for (size_t li = 0; li < localCodebookNo; li++) {
+      for (size_t k = 1; k < localCodebookCentroidNo; k++) {
+#if defined(NGT_SHARED_MEMORY_ALLOCATOR)
+	NGT::PersistentObject &lcentroid = *static_cast<NGT::PersistentObject*>(localCodebookIndexes[li].getObjectSpace().getRepository().get(k));
+	float *subVector = reinterpret_cast<float*>(&lcentroid.at(0, localCodebookIndexes[li].getObjectSpace().getRepository().allocator));
+#else
+	NGT::Object &lcentroid = *static_cast<NGT::Object*>(localCodebookIndexes[li].getObjectSpace().getRepository().get(k));
+	float *subVector = reinterpret_cast<float*>(&lcentroid[0]);
+#endif
+	for (size_t d = 0; d < localDataSize; d++) {
+	  lc[(li * localDataSize + d) * localCodebookCentroidNoSIMD + (k - 1)] = subVector[d];
+	}
+      }
+    }
+    
+    localCentroidsForSIMD = lc;
 
 
   }
@@ -801,19 +1295,24 @@ public:
     c.initialize(localCodebookNo, localCodebookCentroidNo);
   }
 
-  NGT::Index	*globalCodebook;
-  NGT::Index	*localCodebook;
+  NGT::Index	*globalCodebookIndex;
+  NGT::Index	*localCodebookIndexes;
   size_t	localDivisionNo;
   size_t	localCodebookNo;
   size_t	localCodebookCentroidNo;
 
   size_t	localDataSize;
   size_t	sizeOfType;
-
+  size_t	dimension;
+  vector<float>	globalCentroid;
+  QuantizationCodebook<float>	*quantizationCodebook;
+  
   float		*localCentroids;	
+  float		*localCentroidsForSIMD;	
 
   size_t	localCodebookCentroidNoSIMD;
 
+  Rotation	*rotation;
 };  
 
 template <typename T>
@@ -863,11 +1362,11 @@ public:
   }
   inline double operator()(NGT::Object &object, size_t objectID, void *l, DistanceLookupTable &distanceLUT) {
     T *localID = static_cast<T*>(l);
-    NGT::PersistentObject &gcentroid = *globalCodebook->getObjectSpace().getRepository().get(objectID);
-    size_t sizeOfObject = globalCodebook->getObjectSpace().getByteSizeOfObject();
+    NGT::PersistentObject &gcentroid = *globalCodebookIndex->getObjectSpace().getRepository().get(objectID);
+    size_t sizeOfObject = globalCodebookIndex->getObjectSpace().getByteSizeOfObject();
     size_t localDataSize = sizeOfObject / localDivisionNo  / sizeof(uint8_t);
 #if defined(NGT_SHARED_MEMORY_ALLOCATOR)
-    unsigned char *gcptr = &gcentroid.at(0, globalCodebook->getObjectSpace().getRepository().allocator);
+    unsigned char *gcptr = &gcentroid.at(0, globalCodebookIndex->getObjectSpace().getRepository().allocator);
 #else
     unsigned char *gcptr = &gcentroid[0];
 #endif
@@ -880,9 +1379,9 @@ public:
 	gcptr += localDataSize;
       } else {
 	size_t idx = localCodebookNo == 1 ? 0 : li;
-	NGT::PersistentObject &lcentroid = *localCodebook[idx].getObjectSpace().getRepository().get(localID[li]);
+	NGT::PersistentObject &lcentroid = *localCodebookIndexes[idx].getObjectSpace().getRepository().get(localID[li]);
 #if defined(NGT_SHARED_MEMORY_ALLOCATOR)
-	float *lcptr = (float*)&lcentroid.at(0, localCodebook[idx].getObjectSpace().getRepository().allocator);
+	float *lcptr = (float*)&lcentroid.at(0, localCodebookIndexes[idx].getObjectSpace().getRepository().allocator);
 #else
 	float *lcptr = (float*)&lcentroid[0];
 #endif
@@ -898,7 +1397,11 @@ public:
     }
     return sqrt(distance);	
   }
+#ifdef NGTLQG_MIN
+  inline float operator()(void *inv, float *distances, size_t size, DistanceLookupTableUint8 &distanceLUT) {
+#else
   inline void operator()(void *inv, float *distances, size_t size, DistanceLookupTableUint8 &distanceLUT) {
+#endif
     cerr << "operator is not implemented" << endl;
     abort();
   }
@@ -953,22 +1456,50 @@ public:
   }
 
 
+  
+  inline float horizontalMin(__m256 &a, __m256 &b, float noOfObjects) {
+    __m256 seq = _mm256_set_ps(8, 7, 6, 5, 4, 3, 2, 1);
+    __m256 mask = _mm256_sub_ps(_mm256_set1_ps(noOfObjects), seq);
+    mask = _mm256_blendv_ps(_mm256_set1_ps(0.0), _mm256_set1_ps(std::numeric_limits<float>::max()), mask);
+    __m256 data = _mm256_max_ps(a, mask);
+    noOfObjects -= 8;
+    if (noOfObjects > 0.0) {
+      mask = _mm256_sub_ps(_mm256_set1_ps(noOfObjects), seq);
+      mask = _mm256_blendv_ps(_mm256_set1_ps(0.0), _mm256_set1_ps(std::numeric_limits<float>::max()), mask);
+      b = _mm256_max_ps(b, mask);
+      data = _mm256_min_ps(data, b);
+    }
+
+    data = _mm256_min_ps(data, (__m256)_mm256_permute4x64_epi64((__m256i)data, _MM_SHUFFLE(3, 2, 3, 2)));
+    data = _mm256_min_ps(data, (__m256)_mm256_srli_si256((__m256i)data, 8));
+    data = _mm256_min_ps(data, (__m256)_mm256_srli_si256((__m256i)data, 4));
+    //std::cerr << "ret=" << data[0] << std::endl;
+    return data[0];
+  }
+
 #if defined(NGTQG_AVX512) || defined(NGTQG_AVX2)
-  inline void operator()(void *inv, float *distances, size_t size, DistanceLookupTableUint8 &distanceLUT) {
+#ifdef NGTLQG_MIN
+  inline float operator()(void *inv, float *distances, size_t noOfObjects, DistanceLookupTableUint8 &distanceLUT) {
+#else
+  inline void operator()(void *inv, float *distances, size_t noOfObjects, DistanceLookupTableUint8 &distanceLUT) {
+#endif
     uint8_t *localID = static_cast<uint8_t*>(inv);
     float *d = distances;
-    
+    float *lastd = distances + noOfObjects;
+#ifdef NGTLQG_MIN
+    float min = std::numeric_limits<float>::max();
+#endif
 #if defined(NGTQG_AVX512)
-    __m512i mask512x0F = _mm512_set1_epi16(0x000f);
-    __m512i mask512xF0 = _mm512_set1_epi16(0x00f0);
-    constexpr size_t step512 = 32;
-    const size_t range512 = (localDivisionNo >> 2) * step512;
+    const __m512i mask512x0F = _mm512_set1_epi16(0x000f);
+    const __m512i mask512xF0 = _mm512_set1_epi16(0x00f0);
+    const size_t range512 = distanceLUT.range512;
+    constexpr size_t step512 = distanceLUT.step512;
 #endif 
     const __m256i mask256x0F = _mm256_set1_epi16(0x000f);
     const __m256i mask256xF0 = _mm256_set1_epi16(0x00f0);
-    constexpr size_t step256 = 16;
-    const size_t range256 = (((localDivisionNo - 1) >> 1) + 1) * step256; 
-    auto *last = localID + range256 / NGTQ_SIMD_BLOCK_SIZE * size;
+    const size_t range256 = distanceLUT.range256;
+    constexpr size_t step256 = distanceLUT.step256;;
+    auto *last = localID + range256 / NGTQ_SIMD_BLOCK_SIZE * noOfObjects;
     while (localID < last) {
       uint8_t *lut = distanceLUT.localDistanceLookup;
       auto *lastgroup256 = localID + range256;
@@ -1000,20 +1531,15 @@ public:
 	__m256i hi = _mm256_slli_epi16(_mm256_and_si256(packedobj, mask256xF0), 4);
 	__m256i obj = _mm256_or_si256(lo, hi);
 	__m256i vtmp = _mm256_shuffle_epi8(lookupTable, obj);
-	__attribute__((aligned(32))) uint8_t v[32];
-	_mm256_storeu_si256((__m256i*)&v, vtmp);
 
 #if defined(NGTQG_AVX512)
         depu16 = _mm512_adds_epu16(depu16, _mm512_cvtepu8_epi16(vtmp));
 #else
-	__attribute__((aligned(32))) uint16_t v16[16];
-	_mm256_storeu_si256((__m256i*)&v16, depu16l);
-	_mm256_storeu_si256((__m256i*)&v16, depu16h);
 	depu16l = _mm256_adds_epu16(depu16l, _mm256_cvtepu8_epi16(_mm256_extractf128_si256(vtmp, 0)));
 	depu16h = _mm256_adds_epu16(depu16h, _mm256_cvtepu8_epi16(_mm256_extractf128_si256(vtmp, 1)));
 #endif
 	lut += (localCodebookCentroidNo - 1) * 2;
-	localID += 16;
+	localID += step256;
       } 
 
 #if defined(NGTQG_AVX512)
@@ -1030,6 +1556,21 @@ public:
 #endif
       distance = _mm512_sqrt_ps(distance);  
       _mm512_storeu_ps(d, distance);
+#ifdef NGTLQG_MIN
+      {
+	float tmpmin;
+	int rest = 16 - (lastd - d);
+	if (rest > 0) {
+	  __mmask16 mask = 0xffff;
+	  mask >>= rest;
+	  tmpmin = _mm512_mask_reduce_min_ps(mask, distance);
+	} else {
+	  tmpmin = _mm512_reduce_min_ps(distance);
+	}
+	//std::cerr << "tmpmin=" << tmpmin << std::endl;
+	if (min > tmpmin) min = tmpmin;
+      }
+#endif
 #else 
       __m256i lol = _mm256_cvtepu16_epi32(_mm256_extractf128_si256(depu16l, 0));
       __m256i loh = _mm256_cvtepu16_epi32(_mm256_extractf128_si256(depu16l, 1));
@@ -1037,9 +1578,6 @@ public:
       __m256i hih = _mm256_cvtepu16_epi32(_mm256_extractf128_si256(depu16h, 1));
       __m256 distancel = _mm256_cvtepi32_ps(_mm256_add_epi32(lol, hil));
       __m256 distanceh = _mm256_cvtepi32_ps(_mm256_add_epi32(loh, hih));
-      __attribute__((aligned(32))) float v32[8];
-      _mm256_storeu_ps((float*)&v32, distancel);
-      _mm256_storeu_ps((float*)&v32, distanceh);
       __m256 scalel = _mm256_broadcastss_ps(*reinterpret_cast<__m128*>(&distanceLUT.scales[0]));
       __m256 scaleh = _mm256_broadcastss_ps(*reinterpret_cast<__m128*>(&distanceLUT.scales[0]));
       distancel = _mm256_mul_ps(distancel, scalel);
@@ -1056,25 +1594,34 @@ public:
       distanceh = _mm256_sqrt_ps(distanceh);  
       _mm256_storeu_ps(d, distancel);
       _mm256_storeu_ps(d + 8, distanceh);
+#ifdef NGTLQG_MIN
+      {
+	float tmpmin = horizontalMin(distancel, distanceh, lastd - d);
+	if (min > tmpmin) min = tmpmin;
+      }
+#endif
 #endif 
       d += 16;
     } 
+#ifdef NGTLQG_MIN
+    return min;
+#endif
   }
 
 
 #else 
   inline void operator()(void *inv, float *distances, size_t size, DistanceLookupTableUint8 &distanceLUT) {
     uint8_t *localID = static_cast<uint8_t*>(inv);
-    size_t alignedNumOfSubvectors = ((localDivisionNo - 1) / NGTQ_BATCH_SIZE + 1) * NGTQ_BATCH_SIZE;
+    size_t numOfAlignedSubvectors = ((localDivisionNo - 1) / NGTQ_BATCH_SIZE + 1) * NGTQ_BATCH_SIZE;
     size_t alignedSize = ((size - 1) / 2 + 1) * 2;
     uint32_t d[NGTQ_SIMD_BLOCK_SIZE];
     size_t didx = 0;
-    size_t byteSize = alignedNumOfSubvectors * alignedSize / 2;
+    size_t byteSize = numOfAlignedSubvectors * alignedSize / 2;
     auto *last = localID + byteSize;
     while (localID < last) {
       uint8_t *lut = distanceLUT.localDistanceLookup;
       memset(d, 0, sizeof(uint32_t) * NGTQ_SIMD_BLOCK_SIZE);
-      for (size_t li = 0; li < alignedNumOfSubvectors; li++) {
+      for (size_t li = 0; li < numOfAlignedSubvectors; li++) {
 	for (size_t i = 0; i < NGTQ_SIMD_BLOCK_SIZE; i++) {
 	  uint8_t obj = *localID;
 	  if (i % 2 == 0) {
@@ -1101,9 +1648,9 @@ public:
   }
   inline double operator()(NGT::Object &object, size_t objectID, void *l, DistanceLookupTable &distanceLUT) {
     T *localID = static_cast<T*>(l);
-    NGT::PersistentObject &gcentroid = *globalCodebook->getObjectSpace().getRepository().get(objectID);
+    NGT::PersistentObject &gcentroid = *globalCodebookIndex->getObjectSpace().getRepository().get(objectID);
 #if defined(NGT_SHARED_MEMORY_ALLOCATOR)
-    float *gcptr = (float*)&gcentroid.at(0, globalCodebook->getObjectSpace().getRepository().allocator);
+    float *gcptr = (float*)&gcentroid.at(0, globalCodebookIndex->getObjectSpace().getRepository().allocator);
 #else
     float *gcptr = (float*)&gcentroid[0];
 #endif
@@ -1117,9 +1664,9 @@ public:
 	gcptr += localDataSize;
       } else {
         size_t idx = li;
-	NGT::PersistentObject &lcentroid = *localCodebook[idx].getObjectSpace().getRepository().get(localID[li]);
+	NGT::PersistentObject &lcentroid = *localCodebookIndexes[idx].getObjectSpace().getRepository().get(localID[li]);
 #if defined(NGT_SHARED_MEMORY_ALLOCATOR)
-	float *lcptr = (float*)&lcentroid.at(0, localCodebook[idx].getObjectSpace().getRepository().allocator);
+	float *lcptr = (float*)&lcentroid.at(0, localCodebookIndexes[idx].getObjectSpace().getRepository().allocator);
 #else
 	float *lcptr = (float*)&lcentroid[0];
 #endif
@@ -1158,7 +1705,11 @@ public:
 
 class Quantizer {
 public:
+#ifdef NGTQ_NEURIPS21
+  typedef ObjectFile<NGT::Object>	ObjectList;	
+#else
   typedef ArrayFile<NGT::Object>	ObjectList;	
+#endif
 
   Quantizer(DataType dt, size_t dim) {
     property.dimension = dim;
@@ -1179,24 +1730,38 @@ public:
   virtual ~Quantizer() { }
 
   virtual void create(const string &index,
-		      NGT::Property &globalPropertySet, 
+		      NGT::Property &globalPropertySet,
+#ifdef NGTQ_NEURIPS21
+		      NGT::Property &localPropertySet,
+		      std::vector<float> *rotation = 0,
+		      const string &objectFile = "") = 0;
+#else
 		      NGT::Property &localPropertySet) = 0;
+#endif
   virtual void insert(vector<pair<NGT::Object*, size_t> > &objects) = 0;
   virtual void insert(const string &line, vector<pair<NGT::Object*, size_t> > &objects, size_t id) = 0;
   virtual void insert(vector<float> &object, vector<pair<NGT::Object*, size_t> > &objects, size_t id) = 0;
+  virtual void insertIntoObjectRepository(vector<float> &object, size_t id) = 0;
+  virtual void createIndex(size_t beginID, size_t endID) = 0;
+  virtual void setupInvertedIndexForLQG(std::vector<std::vector<float>> &quantizationCodebook,
+					std::vector<uint32_t> &codebookIndex,
+					std::vector<uint32_t> &objectIndex) = 0;
   virtual void rebuildIndex() = 0;
   virtual void save() = 0;
-  virtual void open(const string &index, NGT::Property &globalProperty) = 0;
-  virtual void open(const string &index) = 0;
+  virtual void open(const string &index, NGT::Property &globalProperty, bool readOnly) = 0;
+  virtual void open(const string &index, bool readOnly) = 0;
   virtual void close() = 0;
+  virtual void closeCodebooks() = 0;
 #ifdef NGTQ_SHARED_INVERTED_INDEX
   virtual void reconstructInvertedIndex(const string &indexFile) = 0;
 #endif
 
   virtual void validate() = 0;
 
+  virtual void extractInvertedIndexObject(InvertedIndexEntry<uint16_t> &invertedIndexObjects, size_t id) = 0;
   virtual void extractInvertedIndexObject(InvertedIndexEntry<uint16_t> &invertedIndexObjects) = 0;
   virtual void extractInvertedIndex(std::vector<std::vector<uint32_t>> &invertedIndex) = 0;
+  virtual void eraseInvertedIndexObject(size_t id) = 0;
 
   virtual NGT::Distance getApproximateDistance(NGT::Object &query, uint32_t globalID, uint16_t *localID, QuantizedObjectDistance::DistanceLookupTable &distanceLUT) { abort(); }
 
@@ -1217,21 +1782,20 @@ public:
 
   virtual void info(ostream &os, char mode) = 0;
 
-  virtual NGT::Index & getLocalCodebook(size_t size) = 0;
-
   virtual void verify() = 0;
-
-  virtual size_t getLocalCodebookSize(size_t size) = 0;
 
   virtual size_t getInstanceSharedMemorySize(ostream &os, SharedMemoryAllocator::GetMemorySizeType t = SharedMemoryAllocator::GetTotalMemorySize) = 0;
 
   NGT::Object *allocateObject(string &line, const string &sep) {
-    return globalCodebook.allocateObject(line, " \t");
+    return globalCodebookIndex.allocateObject(line, " \t");
   }
   NGT::Object *allocateObject(vector<double> &obj) {
-    return globalCodebook.allocateObject(obj);
+    return globalCodebookIndex.allocateObject(obj);
   }
-  void deleteObject(NGT::Object *object) { globalCodebook.deleteObject(object); }
+  NGT::Object *allocateObject(vector<float> &obj) {
+    return globalCodebookIndex.allocateObject(obj);
+  }
+  void deleteObject(NGT::Object *object) { globalCodebookIndex.deleteObject(object); }
   
   void setThreadSize(size_t size) { property.threadSize = size; }
   void setGlobalRange(float r) { property.globalRange = r; }
@@ -1241,11 +1805,14 @@ public:
   void setDimension(size_t s) { property.dimension = s; }
   void setDistanceType(DistanceType t) { property.distanceType = t; }
 
+  NGT::Index &getLocalCodebook(size_t idx) { return localCodebookIndexes[idx]; }
+  size_t getLocalCodebookSize(size_t size) { return localCodebookIndexes[size].getObjectRepositorySize(); }
+
   string getRootDirectory() { return rootDirectory; }
 
   size_t getSharedMemorySize(ostream &os, SharedMemoryAllocator::GetMemorySizeType t = SharedMemoryAllocator::GetTotalMemorySize) {
     os << "Global centroid:" << endl;
-    return globalCodebook.getSharedMemorySize(os, t) + getInstanceSharedMemorySize(os, t);
+    return globalCodebookIndex.getSharedMemorySize(os, t) + getInstanceSharedMemorySize(os, t);
   }
 
   virtual QuantizedObjectDistance &getQuantizedObjectDistance() = 0;
@@ -1255,13 +1822,20 @@ public:
 
   Property	property;
 
-  NGT::Index	globalCodebook;
+  NGT::Index	globalCodebookIndex;
 
   size_t	distanceComputationCount;
 
   size_t	localIDByteSize;
   NGT::ObjectSpace::ObjectType objectType;
   size_t	divisionNo;
+
+  std::vector<NGT::Index>	localCodebookIndexes;
+#ifdef NGTQ_LQBG
+  QuantizationCodebook<float>	quantizationCodebook;
+  std::vector<uint32_t>		objectToBlobIndex;
+  Rotation			rotation;
+#endif
 
 };
 
@@ -1282,13 +1856,17 @@ class QuantizedObjectProcessingStream {
   }
 
   void initialize(size_t divisionNo) {
-    alignedNumOfSubvectors = ((divisionNo - 1) / NGTQ_BATCH_SIZE + 1) * NGTQ_BATCH_SIZE;
-    alignedBlockSize = NGTQ_SIMD_BLOCK_SIZE * alignedNumOfSubvectors;
+    numOfAlignedSubvectors = ((divisionNo - 1) / NGTQ_BATCH_SIZE + 1) * NGTQ_BATCH_SIZE;
+    alignedBlockSize = NGTQ_SIMD_BLOCK_SIZE * numOfAlignedSubvectors;
   }
 
+  static size_t getNumOfAlignedObjects(size_t numOfObjects) {
+    return (((numOfObjects - 1) / NGTQ_SIMD_BLOCK_SIZE + 1) * NGTQ_SIMD_BLOCK_SIZE);
+  }
+  
   void setStreamSize(size_t numOfObjects) {
-    alignedNumOfObjects = (((numOfObjects - 1) / NGTQ_SIMD_BLOCK_SIZE + 1) * NGTQ_SIMD_BLOCK_SIZE);
-    streamSize = alignedNumOfObjects * alignedNumOfSubvectors;
+    numOfAlignedObjects  = getNumOfAlignedObjects(numOfObjects);
+    streamSize = numOfAlignedObjects * numOfAlignedSubvectors;
     return;
   }
 
@@ -1307,7 +1885,7 @@ class QuantizedObjectProcessingStream {
     size_t uint4StreamSize = streamSize / 2;
     uint8_t *uint4Objects = new uint8_t[uint4StreamSize]();
     while (idx < streamSize) {
-      for (size_t lidx = 0; lidx < alignedNumOfSubvectors; lidx++) {
+      for (size_t lidx = 0; lidx < numOfAlignedSubvectors; lidx++) {
 	for (size_t bidx = 0; bidx < NGTQ_SIMD_BLOCK_SIZE; bidx++) {
 	  if (idx / 2 > uint4StreamSize) {
 	    std::stringstream msg;
@@ -1343,48 +1921,61 @@ class QuantizedObjectProcessingStream {
   }
 
   uint8_t	*stream;
-  size_t	alignedNumOfSubvectors;
+  size_t	numOfAlignedSubvectors;
   size_t	alignedBlockSize;
-  size_t	alignedNumOfObjects;
+  size_t	numOfAlignedObjects ;
   size_t	streamSize;
 };
  
 class GenerateResidualObject {
 public:
+  GenerateResidualObject():globalCodebookIndex(0), objectList(0), quantizationCodebook(0) {}
   virtual ~GenerateResidualObject() {}
+#ifdef NGTQ_LQBG
+  virtual void operator()(NGT::Object &object, size_t centroidID, float *subspaceObject) = 0;
+  virtual void operator()(NGT::Object &object, size_t centroidID, 
+			  vector<vector<pair<NGT::Object*, size_t> > > &localObjs) = 0;
+#else
   virtual void operator()(size_t objectID, size_t centroidID, 
 			  vector<vector<pair<NGT::Object*, size_t> > > &localObjs) = 0;
-
+#endif
   void set(NGT::Index &gc, NGT::Index lc[], size_t dn, size_t lcn,
-	   Quantizer::ObjectList *ol) {
-    globalCodebook = &(NGT::GraphAndTreeIndex&)gc.getIndex();;
+	   Quantizer::ObjectList *ol, QuantizationCodebook<float> *qc) {
+    globalCodebookIndex = &(NGT::GraphAndTreeIndex&)gc.getIndex();
     divisionNo = dn;
     objectList = ol;
     set(lc, lcn);
+    quantizationCodebook = qc;
   }
   void set(NGT::Index lc[], size_t lcn) {
-    localCodebook.clear();
+    localCodebookIndexes.clear();
     localCodebookNo = lcn;
     for (size_t i = 0; i < localCodebookNo; ++i) {
-      localCodebook.push_back(&(NGT::GraphAndTreeIndex&)lc[i].getIndex());
+      localCodebookIndexes.push_back(&(NGT::GraphAndTreeIndex&)lc[i].getIndex());
     }
   }
 
-  NGT::GraphAndTreeIndex		*globalCodebook;
-  vector<NGT::GraphAndTreeIndex*>	localCodebook;
+  NGT::GraphAndTreeIndex		*globalCodebookIndex;
+  vector<NGT::GraphAndTreeIndex*>	localCodebookIndexes;
   size_t				divisionNo;
   size_t				localCodebookNo;
   Quantizer::ObjectList			*objectList;
+  QuantizationCodebook<float>		*quantizationCodebook;
 };
 
 class GenerateResidualObjectUint8 : public GenerateResidualObject {
 public:
+#ifdef NGTQ_LQBG
+  void operator()(NGT::Object &object, size_t centroidID, float *subspaceObject) { abort(); }
+  void operator()(NGT::Object &xobject, size_t centroidID,
+		  vector<vector<pair<NGT::Object*, size_t> > > &localObjs) { abort(); }
+#else
   void operator()(size_t objectID, size_t centroidID, 
 		  vector<vector<pair<NGT::Object*, size_t> > > &localObjs) {
-    NGT::PersistentObject &globalCentroid = *globalCodebook->getObjectSpace().getRepository().get(centroidID);
-    NGT::Object object(&globalCodebook->getObjectSpace());
-    objectList->get(objectID, object, &globalCodebook->getObjectSpace());
-    size_t sizeOfObject = globalCodebook->getObjectSpace().getByteSizeOfObject();
+    NGT::PersistentObject &globalCentroid = *globalCodebookIndex->getObjectSpace().getRepository().get(centroidID);
+    NGT::Object object(&globalCodebookIndex->getObjectSpace());
+    objectList->get(objectID, object, &globalCodebookIndex->getObjectSpace());
+    size_t sizeOfObject = globalCodebookIndex->getObjectSpace().getByteSizeOfObject();
     size_t lsize = sizeOfObject / divisionNo;
     for (size_t di = 0; di < divisionNo; di++) {
       vector<double> subObject;
@@ -1392,26 +1983,76 @@ public:
       for (size_t d = 0; d < lsize; d++) {
 #if defined(NGT_SHARED_MEMORY_ALLOCATOR)
 	subObject[d] = (double)object[di * lsize + d] - 
-	  (double)globalCentroid.at(di * lsize + d, globalCodebook->getObjectSpace().getRepository().allocator);
+	  (double)globalCentroid.at(di * lsize + d, globalCodebookIndex->getObjectSpace().getRepository().allocator);
 #else
 	subObject[d] = (double)object[di * lsize + d] - (double)globalCentroid[di * lsize + d];
 #endif
       }
       size_t idx = localCodebookNo == 1 ? 0 : di;
-      NGT::Object *localObj = localCodebook[idx]->allocateObject(subObject);
+      NGT::Object *localObj = localCodebookIndexes[idx]->allocateObject(subObject);
+      localObjs[idx].push_back(pair<NGT::Object*, size_t>(localObj, 0));
+    }
+  }
+#endif
+
+};
+
+#ifdef NGTQ_LQBG
+class GenerateResidualObjectFloat : public GenerateResidualObject {
+public:
+  void operator()(NGT::Object &object, size_t centroidID, float *subspaceObject) {
+    size_t dimension = globalCodebookIndex->getObjectSpace().getPaddedDimension();
+    auto *vector = static_cast<float*>(object.getPointer());
+    for (size_t d = 0; d < dimension; d++) {
+#ifdef NGTQG_ZERO_GLOBAL
+      subspaceObject[d] = vector[d];
+#else
+      if (centroidID == std::numeric_limits<uint32_t>::max()) {
+	subspaceObject[d] = vector[d];
+      } else {
+	subspaceObject[d] = vector[d] - quantizationCodebook->at(centroidID, d);
+      }
+#endif
+    }
+  }
+  void operator()(NGT::Object &object, size_t centroidID, 
+		  vector<vector<pair<NGT::Object*, size_t>>> &localObjs) {
+    size_t byteSizeOfObject = globalCodebookIndex->getObjectSpace().getByteSizeOfObject();
+    size_t localByteSize = byteSizeOfObject / divisionNo;
+    size_t localDimension = localByteSize / sizeof(float);
+    for (size_t di = 0; di < divisionNo; di++) {
+#ifndef NGTQG_ZERO_GLOBAL
+      vector<double> subObject;
+      subObject.resize(localDimension);
+#endif
+      float *subVector = static_cast<float*>(object.getPointer(di * localByteSize));
+#ifndef NGTQG_ZERO_GLOBAL
+#if defined(NGT_SHARED_MEMORY_ALLOCATOR)
+      float *globalCentroidSubVector = static_cast<float*>(globalCentroid.getPointer(di * localByteSize, 
+										     globalCodebookIndex->getObjectSpace().getRepository().allocator));
+#else
+      float *quantizationCodebookSubvector = quantizationCodebook->data(centroidID) + di * localDimension;
+#endif
+      for (size_t d = 0; d < localDimension; d++) {
+	subObject[d] = static_cast<double>(subVector[d]) - static_cast<double>(quantizationCodebookSubvector[d]);
+      }
+#endif ////////////////////////
+      size_t idx = localCodebookNo == 1 ? 0 : di;
+      NGT::Object *localObj = localCodebookIndexes[idx]->allocateObject(subVector, localDimension);
       localObjs[idx].push_back(pair<NGT::Object*, size_t>(localObj, 0));
     }
   }
 };
 
+#else 
 class GenerateResidualObjectFloat : public GenerateResidualObject {
 public:
   void operator()(size_t objectID, size_t centroidID, 
 		  vector<vector<pair<NGT::Object*, size_t> > > &localObjs) {
-    NGT::PersistentObject &globalCentroid = *globalCodebook->getObjectSpace().getRepository().get(centroidID);
-    NGT::Object object(&globalCodebook->getObjectSpace());
-    objectList->get(objectID, object, &globalCodebook->getObjectSpace());
-    size_t byteSizeOfObject = globalCodebook->getObjectSpace().getByteSizeOfObject();
+    NGT::PersistentObject &globalCentroid = *globalCodebookIndex->getObjectSpace().getRepository().get(centroidID);
+    NGT::Object object(&globalCodebookIndex->getObjectSpace());
+    objectList->get(objectID, object, &globalCodebookIndex->getObjectSpace());
+    size_t byteSizeOfObject = globalCodebookIndex->getObjectSpace().getByteSizeOfObject();
     size_t localByteSize = byteSizeOfObject / divisionNo;
     size_t localDimension = localByteSize / sizeof(float);
     for (size_t di = 0; di < divisionNo; di++) {
@@ -1420,7 +2061,7 @@ public:
       float *subVector = static_cast<float*>(object.getPointer(di * localByteSize));
 #if defined(NGT_SHARED_MEMORY_ALLOCATOR)
       float *globalCentroidSubVector = static_cast<float*>(globalCentroid.getPointer(di * localByteSize, 
-										     globalCodebook->getObjectSpace().getRepository().allocator));
+										     globalCodebookIndex->getObjectSpace().getRepository().allocator));
 #else
       float *globalCentroidSubVector = static_cast<float*>(globalCentroid.getPointer(di * localByteSize));
 #endif
@@ -1428,12 +2069,13 @@ public:
 	subObject[d] = (double)subVector[d] - (double)globalCentroidSubVector[d];
       }
       size_t idx = localCodebookNo == 1 ? 0 : di;
-      NGT::Object *localObj = localCodebook[idx]->allocateObject(subObject);
+      NGT::Object *localObj = localCodebookIndexes[idx]->allocateObject(subObject);
       localObjs[idx].push_back(pair<NGT::Object*, size_t>(localObj, 0));
     }
   }
 };
-
+#endif 
+ 
 template <typename LOCAL_ID_TYPE>
 class QuantizerInstance : public Quantizer {
 public:
@@ -1450,13 +2092,20 @@ public:
     property.localDivisionNo = nCodebooks;
     quantizedObjectDistance = 0;
     generateResidualObject = 0;
+    localCodebooks = 0;
   }
 
   virtual ~QuantizerInstance() { close(); }
 
   void createEmptyIndex(const string &index,
-			NGT::Property &globalProperty, 
-			NGT::Property &localProperty) 
+			NGT::Property &globalProperty,
+#ifdef NGTQ_NEURIPS21
+			NGT::Property &localProperty,
+			std::vector<float> *rotation,
+			const string &objectFile)
+#else
+			NGT::Property &localProperty)
+#endif
   {
     rootDirectory = index;
     NGT::Index::mkdir(rootDirectory);
@@ -1503,51 +2152,89 @@ public:
     if (property.dataSize == 0) {
       NGTThrowException("Quantizer: data size of the object list is 0.");
     }
+#ifdef NGTQ_NEURIPS21
+    if (!objectList.create(fname, objectFile)) {
+      std::stringstream msg;
+      msg << "Quantizer::createEmptyIndex: cannot construct the object list. " << fname << ":" << objectFile;
+      NGTThrowException(msg);
+    }
+    objectList.open(fname, property.dimension);
+#ifdef MULTIPLE_OBJECT_LISTS
+    objectList.multipleOpen(omp_get_max_threads());
+#endif
+#else
     objectList.create(fname, property.dataSize);
     objectList.open(fname);
+#endif
     objectList.close();
+    if (rotation != 0) {
+      Rotation r;
+      r = *rotation;
+      ofstream ofs(rootDirectory + "/qr");
+      r.serialize(ofs);
+    }
 
     property.save(rootDirectory);
   }
 
-  void open(const string &index, NGT::Property &globalProperty) {
-    open(index);
-    globalCodebook.setProperty(globalProperty);
+  void open(const string &index, NGT::Property &globalProperty, bool readOnly) {
+    open(index, readOnly);
+    globalCodebookIndex.setProperty(globalProperty);
   }
 
-  void open(const string &index) {
+  void open(const string &index, bool readOnly) {
     rootDirectory = index;
     property.load(rootDirectory);
     string globalIndex = index + "/global";
-    globalCodebook.open(globalIndex);
+    globalCodebookIndex.open(globalIndex, readOnly);
     size_t localCodebookNo = property.getLocalCodebookNo();
 
-    localCodebook.resize(localCodebookNo);
+    localCodebookIndexes.resize(localCodebookNo);
     for (size_t i = 0; i < localCodebookNo; ++i) {
       stringstream localIndex;
       localIndex << index << "/local-" << i;
-      localCodebook[i].open(localIndex.str());
+      localCodebookIndexes[i].open(localIndex.str());
     }
-#ifdef NGTQ_SHARED_INVERTED_INDEX
-    invertedIndex.open(index + "/ivt", 0);
+#ifdef NGTQ_LQBG
+    if (!readOnly) {
 #else
-    ifstream ifs(index + "/ivt");
-    if (!ifs) {
-      cerr << "Cannot open " << index + "/ivt" << "." << endl;
-      return;
-    }
-    invertedIndex.deserialize(ifs);
+    {
 #endif
-    objectList.open(index + "/obj");
+
+#ifdef NGTQ_SHARED_INVERTED_INDEX
+      invertedIndex.open(index + "/ivt", 0);
+#else
+      ifstream ifs(index + "/ivt");
+      if (!ifs) {
+        cerr << "Cannot open " << index + "/ivt" << "." << endl;
+        return;
+      }
+      invertedIndex.deserialize(ifs);
+#endif
+    }
+    if (!objectList.open(index + "/obj", property.dimension)) {
+      stringstream msg;
+      msg << "NGTQ::Quantizer::open: cannot open the object file. " << index + "/obj" << std::endl;
+      std::cerr << "Ignore: " << msg.str() << std::endl;
+      //NGTThrowException(msg);
+    }
+#ifdef MULTIPLE_OBJECT_LISTS
+    objectList.multipleOpen(omp_get_max_threads());
+#endif
     NGT::Property globalProperty;
-    globalCodebook.getProperty(globalProperty);
+    globalCodebookIndex.getProperty(globalProperty);
     size_t sizeoftype = 0;
     if (globalProperty.objectType == NGT::Property::ObjectType::Float) {
       if (property.localIDByteSize == 4) {
 	quantizedObjectDistance = new QuantizedObjectDistanceFloat<uint32_t>;
       } else if (property.localIDByteSize == 2) {
 	quantizedObjectDistance = new QuantizedObjectDistanceFloat<uint16_t>;
+#ifdef NGTQ_LQBG
+      } else if (property.localIDByteSize == 1) {
+	quantizedObjectDistance = new QuantizedObjectDistanceFloat<uint8_t>;
+#endif
       } else {
+	std::cerr << "Invalid localIDByteSize : " << property.localIDByteSize << std::endl;
 	abort();
       }
       generateResidualObject = new GenerateResidualObjectFloat;
@@ -1568,17 +2255,51 @@ public:
       assert(0);
     }
     assert(quantizedObjectDistance != 0);
-    quantizedObjectDistance->set(&globalCodebook, localCodebook.data(), property.localDivisionNo, property.getLocalCodebookNo(), sizeoftype, property.dimension);
-    generateResidualObject->set(globalCodebook, localCodebook.data(), property.localDivisionNo, property.getLocalCodebookNo(), &objectList);
+    quantizedObjectDistance->set(&globalCodebookIndex, localCodebookIndexes.data(), &quantizationCodebook,
+				 property.localDivisionNo, property.getLocalCodebookNo(), sizeoftype,
+				 property.dimension, &rotation);
+    generateResidualObject->set(globalCodebookIndex, localCodebookIndexes.data(), property.localDivisionNo, property.getLocalCodebookNo(), &objectList, &quantizationCodebook);
     localIDByteSize = property.localIDByteSize;
     objectType = globalProperty.objectType;
     divisionNo = property.localDivisionNo;
+#ifdef NGTQ_LQBG
+    {
+      ifstream ifs(rootDirectory + "/qr");
+      if (ifs) {
+	std::cerr << "loading rotation..." << std::endl;
+	rotation.deserialize(ifs);
+      }
+    }
+    {
+#ifdef NGTQG_ROTATION
+      ifstream irfs(rootDirectory + "/rqcb");
+      if (!irfs) {
+	std::cerr << "Not found the rqcb file. " << rootDirectory + "/rqcb" << std::endl;
+	ifstream ifs(rootDirectory + "/qcb");
+	if (!ifs) {
+	  std::cerr << "Not found the qcb file. " << rootDirectory + "/qcb" << std::endl;
+	} else {
+	  std::cerr << "Load the global codebooks." << std::endl;
+	  quantizationCodebook.deserialize(ifs, readOnly);
+	  std::cerr << "Rotate the global codebooks " << rotation.size() << std::endl;
+	  quantizationCodebook.rotate(rotation);
+	}
+      } else {
+	std::cerr << "Load the rotated global codebooks." << std::endl;
+	quantizationCodebook.deserialize(irfs, readOnly);
+      }
+#else 
+      ifstream ifs(rootDirectory + "/qcb");
+      quantizationCodebook.deserialize(ifs);
+#endif 
+    }
+#endif
   }
 
   void save() {
 #ifndef NGT_SHARED_MEMORY_ALLOCATOR
     string global = rootDirectory + "/global";
-    globalCodebook.saveIndex(global);
+    globalCodebookIndex.saveIndex(global);
     size_t localCodebookNo = property.getLocalCodebookNo();
     for (size_t i = 0; i < localCodebookNo; ++i) {
       stringstream local;
@@ -1586,22 +2307,36 @@ public:
       try {
 	NGT::Index::mkdir(local.str());
       } catch (...) {}
-      localCodebook[i].saveIndex(local.str());
+      localCodebookIndexes[i].saveIndex(local.str());
     }
 #endif // NGT_SHARED_MEMORY_ALLOCATOR
 #ifndef NGTQ_SHARED_INVERTED_INDEX
     ofstream of(rootDirectory + "/ivt");
     invertedIndex.serialize(of);
 #endif
+#ifdef NGTQ_LQBG
+    {
+#ifdef NGTQG_ROTATED_GLOBAL_CODEBOOKS
+      ofstream ofs(rootDirectory + "/rqcb");
+#else
+      ofstream ofs(rootDirectory + "/qcb");
+#endif
+      quantizationCodebook.serialize(ofs);
+    }
+#endif
     property.save(rootDirectory);
+  }
+
+  void closeCodebooks() {
+    globalCodebookIndex.close();
+    for (size_t i = 0; i < localCodebookIndexes.size(); ++i) {
+      localCodebookIndexes[i].close();
+    }
   }
 
   void close() {
     objectList.close();
-    globalCodebook.close();
-    for (size_t i = 0; i < localCodebook.size(); ++i) {
-      localCodebook[i].close();
-    }
+    closeCodebooks();
     if (quantizedObjectDistance != 0) {
       delete quantizedObjectDistance;
       quantizedObjectDistance = 0;
@@ -1613,6 +2348,7 @@ public:
 #ifndef NGTQ_SHARED_INVERTED_INDEX
     invertedIndex.deleteAll();
 #endif
+    delete[] localCodebooks;
   }
 
 #ifdef NGTQ_SHARED_INVERTED_INDEX
@@ -1722,9 +2458,9 @@ public:
     size_t globalCentroidID = id.id;
     if (invertedIndex.isEmpty(globalCentroidID)) {
 #ifdef NGTQ_SHARED_INVERTED_INDEX
-      invertedIndex.put(globalCentroidID, new(invertedIndex.allocator) InvertedIndexEntry<LOCAL_ID_TYPE>(localCodebook.size(), invertedIndex.allocator));
+      invertedIndex.put(globalCentroidID, new(invertedIndex.allocator) InvertedIndexEntry<LOCAL_ID_TYPE>(localCodebookIndexes.size(), invertedIndex.allocator));
 #else
-      invertedIndex.put(globalCentroidID, new InvertedIndexEntry<LOCAL_ID_TYPE>(localCodebook.size()));
+      invertedIndex.put(globalCentroidID, new InvertedIndexEntry<LOCAL_ID_TYPE>(localCodebookIndexes.size()));
 #endif
     }
     assert(!invertedIndex.isEmpty(globalCentroidID));
@@ -1738,7 +2474,8 @@ public:
 #else
       invertedIndexEntry.pushBack(object.second);
 #endif
-      if (property.centroidCreationMode == CentroidCreationModeStatic) {
+      if (property.centroidCreationMode == CentroidCreationModeStatic ||
+	  property.centroidCreationMode == CentroidCreationModeStaticLayer) {
 	localData.push_back(LocalDatam(globalCentroidID, 
 				       invertedIndexEntry.size() - 1)); 
       } else {
@@ -1749,8 +2486,11 @@ public:
       }
     } else {
       if (property.centroidCreationMode != CentroidCreationModeDynamic) {
-	cerr << "Quantizer: Error! Although it is an original quantizer, object has been added to the global." << endl;
-	cerr << "                  Specify the size limitation of the global." << endl;
+	cerr << "Quantizer: Fatal error! Although it is a static global codebook, an object has been added to the global." << endl;
+	cerr << "    The actual size of the global codebook=" << globalCodebookIndex.getObjectRepositorySize() - 1
+	     << ", The size of the global codebook in the property=" << property.globalCentroidLimit << std::endl;
+	cerr << "    The both numbers above should be the same." << std::endl;
+	cerr << "    Specify a proper size limitation for the global codebook?" << endl;
 	assert(id.identical);
 	abort();
       }
@@ -1766,6 +2506,10 @@ public:
 #else
 	invertedIndexEntry[0].setID(object.second);
 #endif
+      }
+      if (property.quantizerType == QuantizerTypeLQG) {
+	localData.push_back(LocalDatam(globalCentroidID, 
+				       invertedIndexEntry.size() - 1)); 
       }
     }
   }
@@ -1791,10 +2535,10 @@ public:
 #endif
       }
 #ifdef NGT_SHARED_MEMORY_ALLOCATOR
-      localCodebook[0].deleteObject(localObjs[0][i].first);
+      localCodebookIndexes[0].deleteObject(localObjs[0][i].first);
 #else
       if (lids[i].identical) {
-	localCodebook[0].deleteObject(localObjs[0][i].first);
+	localCodebookIndexes[0].deleteObject(localObjs[0][i].first);
       }
 #endif
     }
@@ -1803,6 +2547,7 @@ public:
   bool setMultipleLocalCodeToInvertedIndexEntry(vector<NGT::GraphAndTreeIndex*> &lcodebook, vector<LocalDatam> &localData, vector<vector<pair<NGT::Object*, size_t> > > &localObjs) {
     size_t localCodebookNo = property.getLocalCodebookNo();
     bool localCodebookFull = true;  
+#pragma omp parallel for
     for (size_t li = 0; li < localCodebookNo; ++li) {
       float lr = property.localRange;
       size_t localCentroidLimit = property.localCentroidLimit;
@@ -1832,16 +2577,162 @@ public:
 	(*invertedIndex.at(localData[i].iiIdx))[localData[i].iiLocalIdx].localID[li] = id;
 #endif
 #ifdef NGT_SHARED_MEMORY_ALLOCATOR
-	localCodebook[li].deleteObject(localObjs[li][i].first);
+	localCodebookIndexes[li].deleteObject(localObjs[li][i].first);
 #else
 	if (lids[i].identical) {
-	  localCodebook[li].deleteObject(localObjs[li][i].first);
+	  localCodebookIndexes[li].deleteObject(localObjs[li][i].first);
 	}
 #endif
       } 
     } 
     return localCodebookFull;
   }
+
+  bool setMultipleLocalCodeToInvertedIndexEntryLQG(vector<NGT::GraphAndTreeIndex*> &lcodebook,
+						   vector<LocalDatam> &localData,
+						   float *subspaceObjects) {
+						   //vector<vector<pair<NGT::Object*, size_t>>> &localObjs) {
+    size_t paddedDimension = globalCodebookIndex.getObjectSpace().getPaddedDimension();
+    size_t localCodebookNo = property.getLocalCodebookNo();
+    bool localCodebookFull = true;  
+//#pragma omp parallel for
+    for (size_t li = 0; li < localCodebookNo; ++li) {
+      float lr = property.localRange;
+      size_t localCentroidLimit = property.localCentroidLimit;
+      if (property.localCentroidCreationMode == CentroidCreationModeDynamicKmeans) {
+	localCentroidLimit *= property.localClusteringSampleCoefficient;
+      }
+      if (property.localCodebookState) {
+	lr = FLT_MAX;	
+	localCentroidLimit = 0;
+      } else {
+	if (property.localCentroidCreationMode == CentroidCreationModeDynamicKmeans) {
+	  lr = -1.0;
+	}
+      }
+      vector<NGT::Index::InsertionResult> lids;
+      size_t localDimension = lcodebook[li]->getObjectSpace().getDimension();
+      vector<pair<NGT::Object*, size_t>> localObjects(localData.size());
+      for (size_t i = 0; i < localData.size(); i++) {
+	localObjects[i].first = lcodebook[li]->allocateObject(&subspaceObjects[i * paddedDimension + (li * localDimension)], localDimension);
+	localObjects[i].second = 0;
+      }
+      createIndex(*lcodebook[li], localCentroidLimit, localObjects, lids, lr);
+      if (lr != FLT_MAX) { 
+	localCodebookFull = false;
+      }
+      assert(localData.size() == lids.size());
+      for (size_t i = 0; i < localData.size(); i++) {
+	size_t id = lids[i].id;
+	assert(!property.localCodebookState || id <= ((1UL << (sizeof(LOCAL_ID_TYPE) * 8)) - 1)); 
+#ifdef NGTQ_SHARED_INVERTED_INDEX
+	(*invertedIndex.at(localData[i].iiIdx)).at(localData[i].iiLocalIdx, invertedIndex.allocator).localID[li] = id;
+#else
+	(*invertedIndex.at(localData[i].iiIdx))[localData[i].iiLocalIdx].localID[li] = id;
+#endif
+#ifdef NGT_SHARED_MEMORY_ALLOCATOR
+	localCodebookIndexes[li].deleteObject(localObjs[li][i].first);
+#else
+	if (lids[i].identical) {
+	  lcodebook[li]->deleteObject(localObjects[i].first);
+	}
+#endif
+      } 
+    } 
+    return localCodebookFull;
+  }
+
+  void constructLocalCodebooks() {
+    delete localCodebooks;
+    size_t localCodebookNo = property.getLocalCodebookNo();
+    size_t codebookSize = localCodebookIndexes[0].getObjectSpace().getSize() - 1;
+    size_t paddedDimension = globalCodebookIndex.getObjectSpace().getPaddedDimension();
+    size_t localDimension = localCodebookIndexes[0].getObjectSpace().getDimension();
+    localCodebooks = new float[codebookSize * paddedDimension];
+    size_t oft = 0;
+    for (size_t li = 0; li < localCodebookNo; li++) {
+      if (localCodebookIndexes[li].getObjectSpace().getSize() - 1 != codebookSize) {
+	std::cerr << "Fatal Error!" << std::endl;
+	abort();
+      }
+      for (size_t cid = 1; cid <= codebookSize; cid++) {
+	std::vector<float> v;
+	localCodebookIndexes[li].getObjectSpace().getObject(cid, v);
+	for (size_t ld = 0; ld < v.size(); ld++) {
+	  localCodebooks[(cid - 1) *paddedDimension + oft + ld] = v[ld];
+	}
+      }
+      oft += localDimension;
+    }
+    if (oft != globalCodebookIndex.getObjectSpace().getDimension()) {
+      std::cerr << "somethig wrong " << oft << ":" << globalCodebookIndex.getObjectSpace().getDimension() << std::endl;
+      abort();
+    }
+  }
+
+  void setMultipleLocalCodeToInvertedIndexEntryFixedLQG(vector<LocalDatam> &localData,
+							float *subspaceObjects) {
+    if (localData.empty()) {
+      return;
+    }
+    if (localCodebooks == 0) {
+      constructLocalCodebooks();
+    }
+    size_t paddedDimension = globalCodebookIndex.getObjectSpace().getPaddedDimension();
+    size_t localCodebookNo = property.getLocalCodebookNo();
+    size_t codebookSize = property.localCentroidLimit;
+    size_t dimension = globalCodebookIndex.getObjectSpace().getDimension();
+    if (property.dimension % property.localDivisionNo != 0) {
+      std::cerr << "setMultipleLocalCodeToInvertedIndexEntry!!!" << std::endl;
+      abort();
+    }
+    size_t localDimension = property.dimension / property.localDivisionNo;
+    std::unique_ptr<float[]> distance(new float[localData.size() * codebookSize * localCodebookNo]());
+    std::vector<std::pair<float, uint32_t>> min(localData.size() * localCodebookNo, std::make_pair(std::numeric_limits<float>::max(), std::numeric_limits<uint32_t>::max()));
+    if (localCodebooks == 0) {
+      std::cerr << "Quantizer::setMultipleLocalCodeToInvertedEntry: FatalError!" << std::endl;
+      abort();
+    }
+    {
+      size_t oft = 0;
+#pragma omp parallel for
+      for (size_t idx = 0; idx < localData.size(); idx++) {
+	for (size_t cid = 0; cid < codebookSize; cid++) {
+	  for (size_t svi = 0; svi < localCodebookNo; svi++) {
+	    float localDistance = 0.0;
+	    for (size_t ld = 0; ld < localDimension; ld++) {
+	      size_t d = svi * localDimension + ld;
+	      auto dist = subspaceObjects[idx * paddedDimension + d] - localCodebooks[cid * paddedDimension + d];
+	      dist *= dist;
+	      distance[idx * codebookSize * localCodebookNo + cid * localCodebookNo + svi] += dist; 
+	      localDistance = distance[idx * codebookSize * localCodebookNo + cid * localCodebookNo + svi];
+	    }
+	    if (localDistance < min[idx * localCodebookNo + svi].first) {
+	      min[idx * localCodebookNo + svi].first = localDistance;
+	      min[idx * localCodebookNo + svi].second = cid;
+	    }
+	  }
+	}
+      }
+
+
+      
+    }
+#pragma omp parallel for
+    for (size_t li = 0; li < localCodebookNo; ++li) {
+      for (size_t i = 0; i < localData.size(); i++) {
+	size_t id = min[i * localCodebookNo + li].second + 1;
+	assert(!property.localCodebookState || id <= ((1UL << (sizeof(LOCAL_ID_TYPE) * 8)) - 1)); 
+#ifdef NGTQ_SHARED_INVERTED_INDEX
+	(*invertedIndex.at(localData[i].iiIdx)).at(localData[i].iiLocalIdx, invertedIndex.allocator).localID[li] = id;
+#else
+	(*invertedIndex.at(localData[i].iiIdx))[localData[i].iiLocalIdx].localID[li] = id;
+#endif
+      }
+    }
+    return;
+  }
+
   
   void buildMultipleLocalCodebooks(NGT::Index *localCodebook, size_t localCodebookNo, size_t numberOfCentroids) {
     NGT::Clustering clustering;
@@ -1849,6 +2740,7 @@ public:
     clustering.epsilonTo = 0.50;
     clustering.epsilonStep = 0.05;
     clustering.maximumIteration = 20;
+    clustering.clusterSizeConstraint = false; 
     for (size_t li = 0; li < localCodebookNo; ++li) {
       double diff = clustering.kmeansWithNGT(localCodebook[li], numberOfCentroids);
       if (diff > 0.0) {
@@ -1866,12 +2758,18 @@ public:
 	continue;
       }
       IIEntry &invertedIndexEntry = *invertedIndex.at(gidx);
-      for (size_t oi = property.centroidCreationMode == CentroidCreationModeStatic ? 0 : 1;
+      for (size_t oi = ((property.centroidCreationMode == CentroidCreationModeStatic ||
+			 property.centroidCreationMode == CentroidCreationModeStaticLayer) ||
+			property.quantizerType == QuantizerTypeLQG) ? 0 : 1;
 	   oi < invertedIndexEntry.size(); oi++) {
+#ifdef NGTQ_LQBG
+	localData.push_back(LocalDatam(gidx, oi, invertedIndexEntry.subspaceID)); 
+#else
 	localData.push_back(LocalDatam(gidx, oi)); 
+#endif
       }
     }
-    vector<vector<pair<NGT::Object*, size_t> > > localObjs;
+    vector<vector<pair<NGT::Object*, size_t>>> localObjs;
     localObjs.resize(localCodebookNo);	
     for (size_t i = 0; i < localData.size(); i++) {
       IIEntry &invertedIndexEntry = *invertedIndex.at(localData[i].iiIdx);
@@ -1880,24 +2778,70 @@ public:
 				localData[i].iiIdx, // centroid:ID of global codebook
 				localObjs);
 #else
+#ifdef NGTQ_LQBG
+      NGT::Object object(&globalCodebookIndex.getObjectSpace());   
+      objectList.get(invertedIndexEntry[localData[i].iiLocalIdx].id, object, &globalCodebookIndex.getObjectSpace());
+      (*generateResidualObject)(object,
+				localData[i].subspaceID, // centroid:ID of global codebook
+				localObjs);
+#else
       (*generateResidualObject)(invertedIndexEntry[localData[i].iiLocalIdx].id,
 				localData[i].iiIdx, // centroid:ID of global codebook
 				localObjs);
 #endif
+#endif
     }
     vector<NGT::GraphAndTreeIndex*> lcodebook;
     for (size_t i = 0; i < localCodebookNo; i++) {
-      lcodebook.push_back(&(NGT::GraphAndTreeIndex &)localCodebook[i].getIndex());
+      lcodebook.push_back(&(NGT::GraphAndTreeIndex &)localCodebookIndexes[i].getIndex());
     }
     setMultipleLocalCodeToInvertedIndexEntry(lcodebook, localData, localObjs);
   }
 
+  void replaceInvertedIndexEntryLQG(size_t localCodebookNo) {
+    vector<LocalDatam> localData;
+    for (size_t gidx = 1; gidx < invertedIndex.size(); gidx++) {
+      if (invertedIndex.at(gidx) == 0) {
+	std::cerr << "replaceInvertedIndexEntry: Warning. empty inverted index entry. " << gidx << ":" << invertedIndex.size() << std::endl;
+	continue;
+      }
+      IIEntry &invertedIndexEntry = *invertedIndex.at(gidx);
+      for (size_t oi = ((property.centroidCreationMode == CentroidCreationModeStatic ||
+			 property.centroidCreationMode == CentroidCreationModeStaticLayer) ||
+			property.quantizerType == QuantizerTypeLQG) ? 0 : 1;
+	   oi < invertedIndexEntry.size(); oi++) {
+#ifdef NGTQ_LQBG
+	localData.push_back(LocalDatam(gidx, oi, invertedIndexEntry.subspaceID)); 
+#else
+	localData.push_back(LocalDatam(gidx, oi)); 
+#endif
+      }
+    }
+    float subspaceObjects[localData.size()][globalCodebookIndex.getObjectSpace().getPaddedDimension()];
+//#pragma omp parallel for  
+    for (size_t i = 0; i < localData.size(); i++) {
+      IIEntry &invertedIndexEntry = *invertedIndex.at(localData[i].iiIdx);
+#ifdef NGTQ_SHARED_INVERTED_INDEX
+      (*generateResidualObject)(invertedIndexEntry.at(localData[i].iiLocalIdx, invertedIndex.allocator).id,
+				localData[i].iiIdx, // centroid:ID of global codebook
+				localObjs);
+#else
+      NGT::Object object(&globalCodebookIndex.getObjectSpace());   
+      objectList.get(invertedIndexEntry[localData[i].iiLocalIdx].id, object, &globalCodebookIndex.getObjectSpace());
+      (*generateResidualObject)(object, // object
+				invertedIndexEntry.subspaceID,
+				subspaceObjects[i]); // subspace objects
+#endif
+    }
+    setMultipleLocalCodeToInvertedIndexEntryFixedLQG(localData, &subspaceObjects[0][0]);    
+  }
+
   void insert(vector<pair<NGT::Object*, size_t> > &objects) {
-    NGT::GraphAndTreeIndex &gcodebook = (NGT::GraphAndTreeIndex &)globalCodebook.getIndex();
+    NGT::GraphAndTreeIndex &gcodebook = (NGT::GraphAndTreeIndex &)globalCodebookIndex.getIndex();
     vector<NGT::GraphAndTreeIndex*> lcodebook;
     size_t localCodebookNo = property.getLocalCodebookNo();
     for (size_t i = 0; i < localCodebookNo; i++) {
-      lcodebook.push_back(&(NGT::GraphAndTreeIndex &)localCodebook[i].getIndex());
+      lcodebook.push_back(&(NGT::GraphAndTreeIndex &)localCodebookIndexes[i].getIndex());
     }
     float gr = property.globalRange;
     vector<NGT::Index::InsertionResult> ids;	
@@ -1913,18 +2857,34 @@ public:
     for (size_t i = 0; i < ids.size(); i++) {
       setGlobalCodeToInvertedEntry(ids[i], objects[i], localData);
     } 
-    vector<vector<pair<NGT::Object*, size_t> > > localObjs;
+    vector<vector<pair<NGT::Object*, size_t>>> localObjs;
     localObjs.resize(property.getLocalCodebookNo());	
     for (size_t i = 0; i < localData.size(); i++) {
+#if 0
+      {
+	std::cerr << "A:" << i << ":";
+	auto o = globalCodebookIndex.getObjectSpace().getObject(*objects[i].first);
+	for (auto &v : o) {
+	  std::cerr << v << " ";
+	}
+	std::cerr << std::endl;
+      }
+#endif
       IIEntry &invertedIndexEntry = *invertedIndex.at(localData[i].iiIdx);
 #ifdef NGTQ_SHARED_INVERTED_INDEX
       (*generateResidualObject)(invertedIndexEntry.at(localData[i].iiLocalIdx, invertedIndex.allocator).id,
 				localData[i].iiIdx, // centroid:ID of global codebook
 				localObjs);
 #else
+#ifdef NGTQ_LQBG
+      (*generateResidualObject)(*objects[i].first,
+				localData[i].iiIdx, // centroid:ID of global codebook
+				localObjs);
+#else
       (*generateResidualObject)(invertedIndexEntry[localData[i].iiLocalIdx].id,
 				localData[i].iiIdx, // centroid:ID of global codebook
 				localObjs);
+#endif
 #endif
     }
     if (property.singleLocalCodebook) {
@@ -1935,8 +2895,8 @@ public:
       bool localCodebookFull = setMultipleLocalCodeToInvertedIndexEntry(lcodebook, localData, localObjs);
       if ((!property.localCodebookState) && localCodebookFull) { 
 	if (property.localCentroidCreationMode == CentroidCreationModeDynamicKmeans) {
-	  buildMultipleLocalCodebooks(localCodebook.data(), localCodebookNo, property.localCentroidLimit);
-	  (*generateResidualObject).set(localCodebook.data(), localCodebookNo);
+	  buildMultipleLocalCodebooks(localCodebookIndexes.data(), localCodebookNo, property.localCentroidLimit);
+	  (*generateResidualObject).set(localCodebookIndexes.data(), localCodebookNo);
 	  property.localCodebookState = true;	
 	  localCodebookFull = false;		
 	  replaceInvertedIndexEntry(localCodebookNo);
@@ -1948,24 +2908,248 @@ public:
     } 
     for (size_t i = 0; i < objects.size(); i++) {
 #ifdef NGT_SHARED_MEMORY_ALLOCATOR
-      globalCodebook.deleteObject(objects[i].first);
+      globalCodebookIndex.deleteObject(objects[i].first);
 #else
       if (ids[i].identical == true) {
-	globalCodebook.deleteObject(objects[i].first);
+	globalCodebookIndex.deleteObject(objects[i].first);
       }
 #endif
     }
     objects.clear();
   }
 
-  void insert(const string &line, vector<pair<NGT::Object*, size_t> > &objects, size_t count) {
+
+  void searchIndex(NGT::GraphAndTreeIndex &codebook,
+		   size_t centroidLimit,
+		   const vector<pair<NGT::Object*, size_t>> &objects, 
+		   vector<NGT::Index::InsertionResult> &ids, 
+		   float &range, NGT::Index *gqindex)
+  {
+    if (quantizationCodebook.size() == 0) {
+      std::cerr << "Fatal error. quantizationCodebook is empty" << std::endl;
+      abort();
+    }
+    ids.clear();
+    ids.resize(objects.size());
+    size_t foundCount = 0;
+    double foundRank = 0.0;
+#pragma omp parallel for 
+    for (size_t idx = 0; idx < objects.size(); idx++) {
+      auto qid = quantizationCodebook.search(*objects[idx].first);
+      //std::cerr << "qid=" << qid << std::endl;
+      NGT::ObjectDistances result;
+      if (gqindex != 0) {
+	std::vector<float> object(globalCodebookIndex.getObjectSpace().getDimension());
+	memcpy(object.data(), objects[idx].first->getPointer(), sizeof(float) * object.size());
+#define QID_WEIGHT	100	
+	object.push_back(qid * QID_WEIGHT);
+	//NGT::SearchContainer sc(*objects[idx].first);
+	NGT::SearchQuery sc(object);;
+	sc.setResults(&result);
+	sc.setSize(50);
+	sc.radius = FLT_MAX;
+	sc.setEpsilon(0.1);
+	gqindex->search(sc);
+      } else {
+	NGT::SearchContainer sc(*objects[idx].first);
+	sc.setResults(&result);
+	sc.setSize(50);
+	sc.radius = FLT_MAX;
+	sc.setEpsilon(0.1);
+	//timer.start();
+	globalCodebookIndex.search(sc);
+      }
+      int32_t eqi = -1;
+      for (size_t i = 0; i < result.size(); i++) {
+	auto &invertedIndexEntry = *invertedIndex.at(result[i].id);
+	if (invertedIndexEntry.subspaceID == qid) {
+#pragma omp critical
+	  {
+	    foundCount++;
+	    foundRank += i;
+	  }
+	  eqi = i;
+	  break;
+	}
+      }
+      if (eqi < 0) {
+	eqi = 0;
+      }
+      ids[idx].id = result[eqi].id;
+      ids[idx].distance = result[eqi].distance;
+      ids[idx].identical = true;
+    }
+    std::cerr << "searchIndex: Found=" << foundCount << "/" << objects.size() << " rank=" << foundRank / foundCount << std::endl;
+    return;
+
+  }
+
+  void getBlobIDFromObjectToBlobIndex(const vector<pair<NGT::Object*, size_t>> &objects, 
+				      vector<NGT::Index::InsertionResult> &ids)
+  {
+    ids.clear();
+    ids.resize(objects.size());
+#ifdef GET_BLOG_EVAL
+    size_t identicalObjectCount = 0;
+#endif
+    for (size_t idx = 0; idx < objects.size(); idx++) {
+      if (objects[idx].second - 1 >= objectToBlobIndex.size()) {
+	std::cerr << "Quantizer::insertLQG: Object ID is invalid. " << objects[idx].second - 1 << ":" << objectToBlobIndex.size() << std::endl;
+        abort();
+      }
+      ids[idx].id = objectToBlobIndex[objects[idx].second - 1] + 1;
+      ids[idx].distance = 0.0;
+      ids[idx].identical = true;
+#ifdef GET_BLOG_EVAL
+      {
+	NGT::ObjectDistances result;
+	NGT::SearchContainer sc(*objects[idx].first);
+	sc.setResults(&result);
+	sc.setSize(50);
+	sc.radius = FLT_MAX;
+	sc.setEpsilon(0.1);
+	globalCodebookIndex.search(sc);
+	//std::cerr << "insertLQG:Eval: ";
+	if (result[0].id == ids[idx].id) {
+	  identicalObjectCount++;
+	} else {
+	}
+      }
+#endif
+    }
+#ifdef GET_BLOG_EVAL
+    std::cerr << identicalObjectCount << "/" << objects.size() << std::endl;
+#endif
+    return;
+  }
+
+  NGT::Index *buildGlobalCodebookWithQIDIndex() {
+    NGT::Property property;
+    
+    property.dimension = globalCodebookIndex.getObjectSpace().getDimension() + 1;
+    property.distanceType = NGT::Index::Property::DistanceType::DistanceTypeL2;
+    NGT::Index *index = new NGT::Index(property);
+    for (size_t id = 1; id < globalCodebookIndex.getObjectRepositorySize(); id++) {
+      std::vector<float> object;
+      if (id % 10000 == 0) {
+	std::cerr << "# of processed objects=" << id << std::endl;
+      }
+      globalCodebookIndex.getObjectSpace().getObject(id, object);
+      object.push_back(invertedIndex.at(id)->subspaceID * QID_WEIGHT);
+      index->append(object);
+    }
+    index->createIndex(50);
+    return index;
+  }
+
+  void insertLQG(vector<pair<NGT::Object*, size_t> > &objects, NGT::Index *gqindex) {
+    NGT::GraphAndTreeIndex &gcodebook = (NGT::GraphAndTreeIndex &)globalCodebookIndex.getIndex();
+    size_t localCodebookNo = property.getLocalCodebookNo();
+    vector<NGT::GraphAndTreeIndex*> lcodebook;
+    for (size_t i = 0; i < localCodebookNo; i++) {
+      lcodebook.push_back(&static_cast<NGT::GraphAndTreeIndex &>(localCodebookIndexes[i].getIndex()));
+    }
+    float gr = property.globalRange;
+    vector<NGT::Index::InsertionResult> ids;	
+    if (property.centroidCreationMode == CentroidCreationModeStaticLayer) {
+      if (objectToBlobIndex.empty()) {
+	searchIndex(gcodebook, property.globalCentroidLimit, objects, ids, gr, gqindex);
+      } else {
+	getBlobIDFromObjectToBlobIndex(objects, ids);
+      }
+    } else {
+      createIndex(gcodebook, property.globalCentroidLimit, objects, ids, gr);
+    }
+#ifdef NGTQ_SHARED_INVERTED_INDEX
+    if (invertedIndex.getAllocatedSize() <= invertedIndex.size() + objects.size()) {
+      invertedIndex.reserve(invertedIndex.getAllocatedSize() * 2);
+    }
+#else
+    invertedIndex.reserve(invertedIndex.size() + objects.size());
+#endif
+    vector<LocalDatam> localData;
+    for (size_t i = 0; i < ids.size(); i++) {
+      setGlobalCodeToInvertedEntry(ids[i], objects[i], localData);
+    } 
+    float subspaceObjects[localData.size()][globalCodebookIndex.getObjectSpace().getPaddedDimension()];
+#pragma omp parallel for  
+    for (size_t i = 0; i < localData.size(); i++) {
+      IIEntry &invertedIndexEntry = *invertedIndex.at(localData[i].iiIdx);
+#ifdef NGTQ_SHARED_INVERTED_INDEX
+      (*generateResidualObject)(invertedIndexEntry.at(localData[i].iiLocalIdx, invertedIndex.allocator).id,
+				localData[i].iiIdx, // centroid:ID of global codebook
+				localObjs);
+#else
+#ifdef NGTQ_LQBG
+
+#ifdef NGTQG_ROTATED_GLOBAL_CODEBOOKS
+      if (!rotation.empty()) {
+	rotation.mul(static_cast<float*>(objects[i].first->getPointer()));
+      }
+#endif
+      (*generateResidualObject)(*objects[i].first, // object
+				//localData[i].iiIdx, // global centroid ID
+				invertedIndexEntry.subspaceID,
+				subspaceObjects[i]); // subspace objects
+#ifndef NGTQG_ROTATED_GLOBAL_CODEBOOKS
+      rotation.mul(subspaceObjects[i]); /////////////////////////////
+#endif
+#else
+      (*generateResidualObject)(invertedIndexEntry[localData[i].iiLocalIdx].id,
+				localData[i].iiIdx, // centroid:ID of global codebook
+				localObjs);
+#endif
+#endif
+
+    } 
+
+    
+    if (property.singleLocalCodebook) {
+      // single local codebook
+      std::cerr << "insert: Fatal Error. single local codebook isn't available." << std::endl;
+      abort();
+    } else { 
+      // multiple local codebooks
+      bool localCodebookFull = true;
+      if (property.localCodebookState) {
+	setMultipleLocalCodeToInvertedIndexEntryFixedLQG(localData, &subspaceObjects[0][0]);
+      } else {
+	localCodebookFull = setMultipleLocalCodeToInvertedIndexEntryLQG(lcodebook, localData, &subspaceObjects[0][0]);
+      }
+      if ((!property.localCodebookState) && localCodebookFull) {
+	if (property.localCentroidCreationMode == CentroidCreationModeDynamicKmeans) {
+	  buildMultipleLocalCodebooks(localCodebookIndexes.data(), localCodebookNo, property.localCentroidLimit);
+	  (*generateResidualObject).set(localCodebookIndexes.data(), localCodebookNo);
+	  property.localCodebookState = true;	
+	  localCodebookFull = false;		
+	  replaceInvertedIndexEntryLQG(localCodebookNo);
+	} else {
+	  property.localCodebookState = true;	
+	  localCodebookFull = false;
+	}
+      }
+    } 
+#pragma omp parallel for
+    for (size_t i = 0; i < objects.size(); i++) {
+#ifdef NGT_SHARED_MEMORY_ALLOCATOR
+      globalCodebookIndex.deleteObject(objects[i].first);
+#else
+      if (ids[i].identical == true) {
+	globalCodebookIndex.deleteObject(objects[i].first);
+      }
+#endif
+    }
+    objects.clear();
+  }
+
+void insert(const string &line, vector<pair<NGT::Object*, size_t> > &objects, size_t count) {
     size_t id = count;
     if (count == 0) {
       id = objectList.size();
       id = id == 0 ? 1 : id;
     }
-    NGT::Object *object = globalCodebook.allocateObject(line, " \t");
-    objectList.put(id, *object, &globalCodebook.getObjectSpace());
+    NGT::Object *object = globalCodebookIndex.allocateObject(line, " \t");
+    objectList.put(id, *object, &globalCodebookIndex.getObjectSpace());
     objects.push_back(pair<NGT::Object*, size_t>(object, id));
     if (objects.size() >= property.batchSize) {
       insert(objects);  // batch insert
@@ -1979,8 +3163,8 @@ public:
       id = id == 0 ? 1 : id;
     }
 
-    NGT::Object *object = globalCodebook.allocateObject(objvector);
-    objectList.put(id, *object, &globalCodebook.getObjectSpace());
+    NGT::Object *object = globalCodebookIndex.allocateObject(objvector);
+    objectList.put(id, *object, &globalCodebookIndex.getObjectSpace());
 
     objects.push_back(pair<NGT::Object*, size_t>(object, id));
 
@@ -1988,6 +3172,86 @@ public:
       insert(objects);   // batch insert
     }
   }
+
+  void insertIntoObjectRepository(vector<float> &objvector, size_t count) {
+    size_t id = count;
+    if (count == 0) {
+      id = objectList.size();
+      id = id == 0 ? 1 : id;
+    }
+    NGT::Object *object = globalCodebookIndex.allocateObject(objvector);
+    std::vector<float> vs = globalCodebookIndex.getObjectSpace().getObject(*object);
+    objectList.put(id, *object, &globalCodebookIndex.getObjectSpace());
+    globalCodebookIndex.deleteObject(object);
+  }
+
+  void createIndex(size_t beginID = 1, size_t endID = 0) {
+    NGT::Index *gqindex = 0;
+    if (property.centroidCreationMode == CentroidCreationModeStaticLayer) {
+      gqindex = buildGlobalCodebookWithQIDIndex();
+    }
+    vector<pair<NGT::Object*, size_t>> objects;
+    objects.reserve(property.batchSize);
+    if (endID == 0) {
+      endID = objectList.size() - 1;
+    }
+    bool localCodebookEnabled = false;
+    NGT::Timer timer;
+    timer.start();
+    for (size_t id = beginID; id <= endID; id++) {
+      if (id % 100000 == 0) {
+	timer.stop();
+	std::cerr << "# of processed objects=" << id << " Time=" << timer << std::endl;
+	timer.restart();
+      }
+      NGT::Object *object = globalCodebookIndex.getObjectSpace().allocateObject();
+      objectList.get(id, *object, &globalCodebookIndex.getObjectSpace());
+      objects.push_back(pair<NGT::Object*, size_t>(object, id));
+      if (objects.size() >= property.batchSize) {
+	//insert(objects);   // batch insert
+	insertLQG(objects, gqindex);   // batch insert
+      }
+    }
+    if (objects.size() > 0) {
+      //insert(objects);   // batch insert
+      insertLQG(objects, gqindex);   // batch insert
+    }
+    delete gqindex;
+  }
+
+  void setupInvertedIndexForLQG(std::vector<std::vector<float>> &qCodebook,
+				std::vector<uint32_t> &codebookIndex,
+				std::vector<uint32_t> &objectIndex) {
+    //IIEntry &invertedIndexEntry = *invertedIndex.at(localData[i].iiIdx);
+    if (globalCodebookIndex.getObjectRepositorySize() != codebookIndex.size() + 1) {
+      std::cerr << "Fatal Error? " << globalCodebookIndex.getObjectRepositorySize() << ":" <<  codebookIndex.size() + 1 << std::endl;
+    }
+    if (!invertedIndex.empty()) {
+      std::cerr << "Fatal Erro! inverted index is not empty." << std::endl;
+      abort();
+    }
+    invertedIndex.reserve(codebookIndex.size() + 1);
+    std::cerr << "codebook Index size=" << codebookIndex.size()<< std::endl;
+    for (size_t idx = 0; idx < codebookIndex.size(); idx++) {
+      auto gid = idx + 1;
+#ifdef NGTQ_SHARED_INVERTED_INDEX
+      invertedIndex.put(gid, new(invertedIndex.allocator) InvertedIndexEntry<LOCAL_ID_TYPE>(localCodebookIndexes.size(), invertedIndex.allocator));
+#else
+      invertedIndex.put(gid, new InvertedIndexEntry<LOCAL_ID_TYPE>(localCodebookIndexes.size()));
+#endif
+      invertedIndex.at(gid)->subspaceID = codebookIndex[idx];
+    }
+    
+    quantizationCodebook.setPaddedDimension(globalCodebookIndex.getObjectSpace().getPaddedDimension());
+    quantizationCodebook = qCodebook;
+#ifdef NGTQG_ROTATED_GLOBAL_CODEBOOKS
+    quantizationCodebook.rotate(rotation);
+#endif
+
+    objectToBlobIndex = std::move(objectIndex);
+    objectIndex.clear();
+  }
+
 
   void rebuildIndex() {
     vector<pair<NGT::Object*, size_t> > objects;
@@ -1999,8 +3263,8 @@ public:
 	  cerr << "Processed " << count;
 	  cerr << endl;
       }
-      NGT::Object *object = globalCodebook.getObjectSpace().allocateObject();
-      objectList.get(idx, *object, &globalCodebook.getObjectSpace());
+      NGT::Object *object = globalCodebookIndex.getObjectSpace().allocateObject();
+      objectList.get(idx, *object, &globalCodebookIndex.getObjectSpace());
       objects.push_back(pair<NGT::Object*, size_t>(object, idx));
       if (objects.size() >= property.batchSize) {
 	insert(objects);
@@ -2012,8 +3276,14 @@ public:
   }
 
   void create(const string &index,
-	      NGT::Property &globalProperty, 
+	      NGT::Property &globalProperty,
+#ifdef NGTQ_NEURIPS21
+	      NGT::Property &localProperty,
+	      std::vector<float> *rotation = 0,
+	      const string &objectFile = ""
+#else
 	      NGT::Property &localProperty
+#endif
 	      ) {
 
     if (property.localCentroidLimit > ((1UL << (sizeof(LOCAL_ID_TYPE) * 8)) - 1)) {
@@ -2122,6 +3392,10 @@ public:
       gp.distanceType = NGT::Index::Property::DistanceType::DistanceTypeNormalizedCosine;
       lp.distanceType = NGT::Index::Property::DistanceType::DistanceTypeL2;
       break;
+    case DistanceTypeCosine:
+      gp.distanceType = NGT::Index::Property::DistanceType::DistanceTypeCosine;
+      lp.distanceType = NGT::Index::Property::DistanceType::DistanceTypeL2;
+      break;
     case DistanceTypeNormalizedL2:
       gp.distanceType = NGT::Index::Property::DistanceType::DistanceTypeNormalizedL2;
       lp.distanceType = NGT::Index::Property::DistanceType::DistanceTypeL2;
@@ -2134,32 +3408,28 @@ public:
       }
     }
 
+#ifdef NGTQ_NEURIPS21
+    createEmptyIndex(index, gp, lp, rotation, objectFile);
+#else
     createEmptyIndex(index, gp, lp);
+#endif
   }
 
   void validate() {
-    size_t gcbSize = globalCodebook.getObjectRepositorySize();
-    cerr << "global codebook size=" << gcbSize << endl;
+    size_t gcbSize = globalCodebookIndex.getObjectRepositorySize();
     for (size_t gidx = 1; gidx < 4 && gidx < gcbSize; gidx++) {
       if (invertedIndex[gidx] == 0) {
 	cerr << "something wrong" << endl;
 	exit(1);
       }
-      cerr << gidx << " inverted index size=" << (*invertedIndex[gidx]).size() << endl;
       if ((*invertedIndex[gidx]).size() == 0) {
 	cerr << "something wrong" << endl;
 	continue;
       }
 
-      NGT::PersistentObject &gcentroid = *globalCodebook.getObjectSpace().getRepository().get(gidx);
+      NGT::PersistentObject &gcentroid = *globalCodebookIndex.getObjectSpace().getRepository().get(gidx);
       vector<double> gco;
-      globalCodebook.getObjectSpace().getRepository().extractObject(&gcentroid, gco);
-      cerr << "global centroid object(" << gco.size() << ")=";
-      for (size_t i = 0; i < gco.size(); i++) {
-	cerr << gco[i] << " ";
-      }
-      cerr << endl;
-
+      globalCodebookIndex.getObjectSpace().getRepository().extractObject(&gcentroid, gco);
       {
 #ifdef NGTQ_SHARED_INVERTED_INDEX
 	InvertedIndexObject<LOCAL_ID_TYPE> &invertedIndexEntry = (*invertedIndex[gidx]).at(0, invertedIndex.allocator);
@@ -2171,10 +3441,10 @@ public:
 	  exit(1);
         }
       }
-      NGT::Object *gcentroidFromList = globalCodebook.getObjectSpace().getRepository().allocateObject();
-      objectList.get(gidx, *gcentroidFromList, &globalCodebook.getObjectSpace());
+      NGT::Object *gcentroidFromList = globalCodebookIndex.getObjectSpace().getRepository().allocateObject();
+      objectList.get(gidx, *gcentroidFromList, &globalCodebookIndex.getObjectSpace());
       vector<double> gcolist;
-      globalCodebook.getObjectSpace().getRepository().extractObject(gcentroidFromList, gcolist);
+      globalCodebookIndex.getObjectSpace().getRepository().extractObject(gcentroidFromList, gcolist);
       if (gco != gcolist) {
 	cerr << "Fatal error! centroid in NGT is different from object list in NGTQ" << endl;
 	exit(1);
@@ -2189,9 +3459,9 @@ public:
         elements.push_back(invertedIndexEntry.id);
 	cerr << "  object ID=" << invertedIndexEntry.id;
 	{
-	  NGT::Object *o = globalCodebook.getObjectSpace().getRepository().allocateObject();
-	  objectList.get(invertedIndexEntry.id, *o, &globalCodebook.getObjectSpace());
-	  NGT::Distance distance = globalCodebook.getObjectSpace().getComparator()(*gcentroidFromList, *o);
+	  NGT::Object *o = globalCodebookIndex.getObjectSpace().getRepository().allocateObject();
+	  objectList.get(invertedIndexEntry.id, *o, &globalCodebookIndex.getObjectSpace());
+	  NGT::Distance distance = globalCodebookIndex.getObjectSpace().getComparator()(*gcentroidFromList, *o);
 	  cerr << ":distance=" << distance;
 	}
 	cerr << ":local codebook IDs=";
@@ -2201,7 +3471,8 @@ public:
 	cerr << endl;
 	for (size_t li = 0; li < property.localDivisionNo; li++) {
 	  if (invertedIndexEntry.localID[li] == 0) {
-	    if (property.centroidCreationMode != CentroidCreationModeStatic) {
+	    if (property.centroidCreationMode != CentroidCreationModeStatic &&
+		property.centroidCreationMode != CentroidCreationModeStaticLayer) {
 	      if (iidx == 0) {
 		break;
 	      }
@@ -2228,20 +3499,20 @@ public:
 	    cerr << "x ";
 	    ngid.push_back(objects[resulti].id);
 	    NGT::ObjectDistances result;
-	    NGT::Object *o = globalCodebook.getObjectSpace().getRepository().allocateObject();
-	    objectList.get(ngid.back(), *o, &globalCodebook.getObjectSpace());
-	    NGT::GraphAndTreeIndex &graphIndex = (NGT::GraphAndTreeIndex &)globalCodebook.getIndex();
+	    NGT::Object *o = globalCodebookIndex.getObjectSpace().getRepository().allocateObject();
+	    objectList.get(ngid.back(), *o, &globalCodebookIndex.getObjectSpace());
+	    NGT::GraphAndTreeIndex &graphIndex = (NGT::GraphAndTreeIndex &)globalCodebookIndex.getIndex();
 	    graphIndex.searchForNNGInsertion(*o, result);
 	    if (result[0].distance > objects[resulti].distance) {
 	      cerr << " Strange! ";
 	      cerr << result[0].distance << ":" << objects[resulti].distance << " ";
 	    }
-	    globalCodebook.getObjectSpace().getRepository().deleteObject(o);
+	    globalCodebookIndex.getObjectSpace().getRepository().deleteObject(o);
 	  }
 	  cerr << "  search object " << resulti << " ID=" << objects[resulti].id << " distance=" << objects[resulti].distance << endl;
 	}
       }
-      globalCodebook.getObjectSpace().getRepository().deleteObject(gcentroidFromList);
+      globalCodebookIndex.getObjectSpace().getRepository().deleteObject(gcentroidFromList);
     }
   }
 
@@ -2249,22 +3520,24 @@ public:
 			    size_t &approximateSearchSize,
 			    size_t codebookSearchSize, 
 			    double epsilon) {
-
+#ifdef	NGTQ_TRACE
+    std::cerr << "searchGlobalCodebook codebookSearchSize=" << codebookSearchSize << std::endl;
+#endif
     NGT::SearchContainer sc(*query);
     sc.setResults(&objects);
     sc.size = codebookSearchSize;
     sc.radius = FLT_MAX;
     sc.explorationCoefficient = epsilon + 1.0;
     if (epsilon >= FLT_MAX) {
-      globalCodebook.linearSearch(sc);
+      globalCodebookIndex.linearSearch(sc);
     } else {
-      globalCodebook.search(sc);
+      globalCodebookIndex.search(sc);
     }
 
   }
 
   inline void aggregateObjectsWithExactDistance(NGT::ObjectDistance &globalCentroid, NGT::Object *query, size_t size, NGT::ObjectSpace::ResultSet &results, size_t approximateSearchSize) {
-    NGT::ObjectSpace &objectSpace = globalCodebook.getObjectSpace();
+    NGT::ObjectSpace &objectSpace = globalCodebookIndex.getObjectSpace();
     for (size_t j = 0; j < invertedIndex[globalCentroid.id]->size() && results.size() < approximateSearchSize; j++) {
 #ifdef NGTQ_SHARED_INVERTED_INDEX
       InvertedIndexObject<LOCAL_ID_TYPE> &invertedIndexEntry = (*invertedIndex[globalCentroid.id]).at(j, invertedIndex.allocator);
@@ -2316,6 +3589,33 @@ public:
      } 
   }
 
+   void eraseInvertedIndexObject(size_t id) {
+     invertedIndex.erase(id);
+   }
+   void extractInvertedIndexObject(InvertedIndexEntry<uint16_t> &invertedIndexObjects, size_t gid) {
+     if (invertedIndex[gid] == 0) {
+       invertedIndexObjects.clear();
+       return;
+     }
+     invertedIndexObjects.subspaceID = invertedIndex[gid]->subspaceID;
+     invertedIndexObjects.resize(invertedIndex[gid]->size());
+     for (size_t idx = 0; idx < invertedIndex[gid]->size(); idx++) {
+#ifdef NGTQ_SHARED_INVERTED_INDEX
+       NGTQ::InvertedIndexObject<LOCAL_ID_TYPE> &entry = (*invertedIndex[gid]).at(idx, invertedIndex.allocator);
+#else
+       NGTQ::InvertedIndexObject<LOCAL_ID_TYPE> &entry = (*invertedIndex[gid])[idx];
+#endif
+       invertedIndexObjects[idx].id = entry.id;
+       if (sizeof(entry.localID[0]) > sizeof(invertedIndexObjects[idx].localID[0])) {
+	 std::cerr << "you should change the object ID type." << std::endl;
+	 abort();
+       }
+       for (size_t i = 0; i < localCodebookIndexes.size(); i++) {
+	 invertedIndexObjects[idx].localID[i] = entry.localID[i];
+       }
+     }
+   }
+   
    void extractInvertedIndexObject(InvertedIndexEntry<uint16_t> &invertedIndexObjects) {
 #ifdef NGTQ_SHARED_INVERTED_INDEX
      std::cerr << "not implemented" << std::endl;
@@ -2457,7 +3757,7 @@ public:
   }
 
   void refineDistance(NGT::Object *query, NGT::ObjectDistances &results) {
-     NGT::ObjectSpace &objectSpace = globalCodebook.getObjectSpace();
+     NGT::ObjectSpace &objectSpace = globalCodebookIndex.getObjectSpace();
      for (auto i = results.begin(); i != results.end(); ++i) {
        NGT::ObjectDistance &result = *i;
        NGT::Object o(&objectSpace);
@@ -2474,7 +3774,7 @@ public:
 	      AggregationMode aggregationMode,
 	      double epsilon = FLT_MAX) {
     size_t approximateSearchSize = size * expansion;
-    size_t codebookSearchSize = approximateSearchSize / (objectList.size() / globalCodebook.getObjectRepositorySize()) + 1;
+    size_t codebookSearchSize = approximateSearchSize / (objectList.size() / globalCodebookIndex.getObjectRepositorySize()) + 1;
     search(query, objs, size, approximateSearchSize, codebookSearchSize, aggregationMode, epsilon);
   }
 
@@ -2550,13 +3850,13 @@ public:
 
 
   double calculateQuantizationError() {
-    NGT::ObjectSpace &objectSpace = globalCodebook.getObjectSpace();
+    NGT::ObjectSpace &objectSpace = globalCodebookIndex.getObjectSpace();
     double distance = 0.0;
     double globalDistance = 0.0;
     size_t count = 0;
     for (size_t gi = 0; gi < invertedIndex.size(); gi++) {
       if (invertedIndex[gi] != 0) {
-	NGT::PersistentObject &gcentroid = *globalCodebook.getObjectSpace().getRepository().get(gi);
+	NGT::PersistentObject &gcentroid = *globalCodebookIndex.getObjectSpace().getRepository().get(gi);
 	for (size_t li = 0; li < invertedIndex[gi]->size(); li++) {
 #ifdef NGTQ_SHARED_INVERTED_INDEX
           size_t id = invertedIndex[gi]->at(li, invertedIndex.allocator).id;
@@ -2572,7 +3872,7 @@ public:
 #endif
 	  distance += d;
 	  count++;
-	  NGT::Distance gd = globalCodebook.getObjectSpace().getComparator()(object, gcentroid);
+	  NGT::Distance gd = globalCodebookIndex.getObjectSpace().getComparator()(object, gcentroid);
 	  globalDistance += gd;
 	}
       }
@@ -2607,22 +3907,20 @@ public:
     }
   }
 
-  NGT::Index &getLocalCodebook(size_t idx) { return localCodebook[idx]; }
-
   void verify() {
     cerr << "sizeof(LOCAL_ID_TYPE)=" << sizeof(LOCAL_ID_TYPE) << endl;
     size_t objcount = objectList.size();
     cerr << "Object count=" << objcount << endl;
-    size_t gcount = globalCodebook.getObjectRepositorySize();
+    size_t gcount = globalCodebookIndex.getObjectRepositorySize();
     cerr << "Global codebook size=" << gcount << endl;
-    size_t lcount = localCodebook[0].getObjectRepositorySize();
+    size_t lcount = localCodebookIndexes[0].getObjectRepositorySize();
     cerr << "Local codebook size=" << lcount << endl;
     lcount *= 1.1;
     cerr << "Inverted index size=" << invertedIndex.size() << endl;
 
     cerr << "Started verifying global codebook..." << endl;
     vector<uint8_t> status;
-    globalCodebook.verify(status);
+    globalCodebookIndex.verify(status);
 
     cerr << "Started verifing the inverted index." << endl;
     size_t errorCount = 0;
@@ -2667,7 +3965,6 @@ public:
     }
   }
 
-  size_t getLocalCodebookSize(size_t size) { return localCodebook[size].getObjectRepositorySize(); }
 
   size_t getInstanceSharedMemorySize(ostream &os, SharedMemoryAllocator::GetMemorySizeType t = SharedMemoryAllocator::GetTotalMemorySize) {
 #ifdef NGTQ_SHARED_INVERTED_INDEX
@@ -2677,8 +3974,8 @@ public:
 #endif
     os << "inverted=" << size << endl;
     os << "Local centroid:" << endl;
-    for (size_t di = 0; di < localCodebook.size(); di++) {
-      size += localCodebook[di].getSharedMemorySize(os, t);
+    for (size_t di = 0; di < localCodebookIndexes.size(); di++) {
+      size += localCodebookIndexes[di].getSharedMemorySize(os, t);
     }
     return size;
   }
@@ -2696,21 +3993,33 @@ public:
 #endif
   QuantizedObjectDistance	*quantizedObjectDistance;
   GenerateResidualObject	*generateResidualObject;
-  std::vector<NGT::Index>	localCodebook;
-
+  float				*localCodebooks;
 };
   
 class Quantization {
 public:
-  static Quantizer *generate(DataType dataType, size_t dimension, size_t divisionNo, size_t localIDByteSize) {
-    Quantizer *quantizer;
-    if (localIDByteSize == 4) {
-      quantizer = new QuantizerInstance<uint32_t>(dataType, dimension, divisionNo);
-    } else if (localIDByteSize == 2) {
-      quantizer = new QuantizerInstance<uint16_t>(dataType, dimension, divisionNo);
+  static Quantizer *generate(Property &property) {
+    DataType dataType      = property.dataType;
+    size_t dimension       = property.dimension;
+    size_t divisionNo      = property.getLocalCodebookNo();
+    size_t localIDByteSize = property.localIDByteSize;
+    Quantizer *quantizer = 0;
+    if (property.centroidCreationMode == CentroidCreationModeNone) {
+      NGTThrowException("Centroid creation mode is not specified");
     } else {
-      cerr << "Not support the specified size of local ID. " << localIDByteSize << endl;
-      abort();
+      if (localIDByteSize == 4) {
+	quantizer = new QuantizerInstance<uint32_t>(dataType, dimension, divisionNo);
+      } else if (localIDByteSize == 2) {
+	quantizer = new QuantizerInstance<uint16_t>(dataType, dimension, divisionNo);
+#ifdef NGTQ_LQBG
+      } else if (localIDByteSize == 1) {
+	quantizer = new QuantizerInstance<uint8_t>(dataType, dimension, divisionNo);
+#endif
+      } else {
+	std::stringstream msg;
+	msg << "Not support the specified size of local ID. " << localIDByteSize;
+	NGTThrowException(msg);
+      }
     }
 
     return quantizer;
@@ -2720,23 +4029,34 @@ public:
  class Index {
  public:
    Index():quantizer(0) {}
-   Index(const string& index):quantizer(0) { open(index); }
+   Index(const string& index, bool rdOnly = false):quantizer(0) { open(index, rdOnly); }
    ~Index() { close(); }
 
 
 
    static void create(const string &index, Property &property, 
 		      NGT::Property &globalProperty,
+#ifdef NGTQ_NEURIPS21
+		      NGT::Property &localProperty,
+		      std::vector<float> *rotation = 0,
+		      const std::string &objectFile = "") {
+#else
 		      NGT::Property &localProperty) {
+#endif
      if (property.dimension == 0) {
        NGTThrowException("NGTQ::create: Error. The dimension is zero.");
      }
      property.setupLocalIDByteSize();
      NGTQ::Quantizer *quantizer = 
-       NGTQ::Quantization::generate(property.dataType, property.dimension, property.getLocalCodebookNo(), property.localIDByteSize);
+       NGTQ::Quantization::generate(property);
      try {
        quantizer->property.setup(property);
+#ifdef NGTQ_NEURIPS21
+       std::cerr << "Index::create " << objectFile << std::endl;
+       quantizer->create(index, globalProperty, localProperty, rotation, objectFile);
+#else
        quantizer->create(index, globalProperty, localProperty);
+#endif
      } catch(NGT::Exception &err) {
        delete quantizer;
        throw err;
@@ -2828,13 +4148,16 @@ public:
 
   }
 
-   void open(const string &index) {
+  void open(const string &index, bool readOnly = false) {
      close();
      NGT::Property globalProperty;
      globalProperty.clear();
      globalProperty.edgeSizeForSearch = 40;
-     quantizer = getQuantizer(index, globalProperty);
-   }
+     quantizer = getQuantizer(index, globalProperty, readOnly);
+     if ((quantizer->property.quantizerType == NGTQ::QuantizerTypeQG) && readOnly) {
+       quantizer->closeCodebooks();
+     }
+  }
 
    void save() {
      getQuantizer().save();
@@ -2854,6 +4177,29 @@ public:
      getQuantizer().insert(objects);
    }
 
+   void insertIntoObjectRepository(std::vector<float> object) {
+     getQuantizer().insertIntoObjectRepository(object, 0);
+   }
+   void createIndex(size_t beginID = 1, size_t endID = 0) {
+     getQuantizer().createIndex(beginID, endID);
+   }
+
+   void createIndex(std::vector<std::vector<float>> &quantizationCodebook,
+		    std::vector<uint32_t> &codebookIndex,
+		    std::vector<uint32_t> &objectIndex,
+		    size_t beginID = 1, size_t endID = 0) {
+     std::cerr << "pass createIndex" << std::endl;
+     setupInvertedIndexForLQG(quantizationCodebook, codebookIndex, objectIndex);
+     createIndex(beginID, endID);
+   }
+
+   void setupInvertedIndexForLQG(std::vector<std::vector<float>> &quantizationCodebook,
+				 std::vector<uint32_t> &codebookIndex,
+				 std::vector<uint32_t> &objectIndex) {
+     getQuantizer().setupInvertedIndexForLQG(quantizationCodebook, codebookIndex, objectIndex);
+   }
+
+
    void rebuildIndex() {
      getQuantizer().rebuildIndex();
    }
@@ -2863,6 +4209,10 @@ public:
    }
 
    NGT::Object *allocateObject(vector<double> &obj) {
+     return getQuantizer().allocateObject(obj);
+   }
+
+   NGT::Object *allocateObject(vector<float> &obj) {
      return getQuantizer().allocateObject(obj);
    }
 
@@ -2895,7 +4245,7 @@ public:
      return *quantizer; 
    }
 
-   size_t getGlobalCodebookSize() { return quantizer->globalCodebook.getObjectRepositorySize(); }
+   size_t getGlobalCodebookSize() { return quantizer->globalCodebookIndex.getObjectRepositorySize(); }
    size_t getLocalCodebookSize(size_t idx) { return quantizer->getLocalCodebookSize(idx); }
 
    size_t getSharedMemorySize(ostream &os, SharedMemoryAllocator::GetMemorySizeType t = SharedMemoryAllocator::GetTotalMemorySize) {
@@ -2903,14 +4253,7 @@ public:
    }
 
  protected:
-
-   static NGTQ::Quantizer *getQuantizer(const string &index) {
-     NGT::Property globalProperty;
-     globalProperty.clear();
-     return getQuantizer(index, globalProperty);
-   }
-
-   static NGTQ::Quantizer *getQuantizer(const string &index, NGT::Property &globalProperty) {
+   static NGTQ::Quantizer *getQuantizer(const string &index, NGT::Property &globalProperty, bool readOnly) {
      NGTQ::Property property;
      try {
        property.load(index);
@@ -2919,13 +4262,12 @@ public:
        msg << "Quantizer::getQuantizer: Cannot load the property. " << index << " : " << err.what();
        NGTThrowException(msg);
      }
-     NGTQ::Quantizer *quantizer =
-       NGTQ::Quantization::generate(property.dataType, property.dimension, property.localDivisionNo, property.localIDByteSize);
+     NGTQ::Quantizer *quantizer = NGTQ::Quantization::generate(property);
      if (quantizer == 0) {
        NGTThrowException("NGTQ::Index: Cannot get quantizer.");
      }
      try {
-       quantizer->open(index, globalProperty);
+       quantizer->open(index, globalProperty, property.quantizerType == NGTQ::QuantizerTypeLQG ? readOnly : false);
      } catch(NGT::Exception &err) {
        delete quantizer;
        throw err;

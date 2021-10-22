@@ -280,6 +280,24 @@ namespace NGT {
     static int getProcessVmSize() { return strtol(getProcessStatus("VmSize")); }
     static int getProcessVmPeak() { return strtol(getProcessStatus("VmPeak")); }
     static int getProcessVmRSS() { return strtol(getProcessStatus("VmRSS")); }
+    static std::string sizeToString(float size) {
+      char unit = 'K';
+      if (size > 1024) {
+	size /= 1024;
+	unit = 'M';
+      }
+      if (size > 1024) {
+	size /= 1024;
+	unit = 'G';
+      }
+      size = round(size * 100) / 100;
+      std::stringstream str;
+      str << size << unit;
+      return str.str();
+    }
+    static std::string getProcessVmSizeStr() { return sizeToString(getProcessVmSize()); }
+    static std::string getProcessVmPeakStr() { return sizeToString(getProcessVmPeak()); }
+    static std::string getProcessVmRSSStr() { return sizeToString(getProcessVmRSS()); }
   };
 
   class StdOstreamRedirector {

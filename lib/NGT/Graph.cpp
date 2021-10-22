@@ -333,6 +333,7 @@ NeighborhoodGraph::setupDistances(NGT::SearchContainer &sc, ObjectDistances &see
   }
 
 #ifdef NGT_DISTANCE_COMPUTATION_COUNT
+  sc.visitCount += seeds.size();
   sc.distanceComputationCount += seeds.size();
 #endif
 }
@@ -416,7 +417,6 @@ NeighborhoodGraph::setupSeeds(NGT::SearchContainer &sc, ObjectDistances &seeds, 
     setupDistances(sc, seeds, COMPARATOR::compare);
     setupSeeds(sc, seeds, results, unchecked, distanceChecked);
 
-
     Distance explorationRadius = sc.explorationCoefficient * sc.radius;
     const size_t dimension = objectSpace->getPaddedDimension();
     ReadOnlyGraphNode *nodes = &searchRepository.front();
@@ -440,16 +440,19 @@ NeighborhoodGraph::setupSeeds(NGT::SearchContainer &sc, ObjectDistances &seeds, 
 
       pair<uint64_t, PersistentObject*>* nsPtrs[neighborSize];
       size_t nsPtrsSize = 0;
-
       for (; neighborptr < neighborendptr; ++neighborptr) {
-       if (!distanceChecked[(*(neighborptr)).first]) {
-         nsPtrs[nsPtrsSize] = neighborptr;
-         if (nsPtrsSize < prefetchOffset) {
-           unsigned char *ptr = reinterpret_cast<unsigned char*>((*(neighborptr)).second);
-           MemoryCache::prefetch(ptr, prefetchSize);
-         }
-         nsPtrsSize++;
-       }
+#ifdef NGT_VISIT_COUNT
+	sc.visitCount++;
+#endif
+	if (!distanceChecked[(*(neighborptr)).first]) {
+	  distanceChecked.insert((*(neighborptr)).first);
+          nsPtrs[nsPtrsSize] = neighborptr;
+          if (nsPtrsSize < prefetchOffset) {
+            unsigned char *ptr = reinterpret_cast<unsigned char*>((*(neighborptr)).second);
+            MemoryCache::prefetch(ptr, prefetchSize);
+          }
+          nsPtrsSize++;
+        }
       }
       for (size_t idx = 0; idx < nsPtrsSize; idx++) {
 	neighborptr = nsPtrs[idx]; 
@@ -457,26 +460,19 @@ NeighborhoodGraph::setupSeeds(NGT::SearchContainer &sc, ObjectDistances &seeds, 
 	  unsigned char *ptr = reinterpret_cast<unsigned char*>((*(nsPtrs[idx + prefetchOffset])).second);
 	  MemoryCache::prefetch(ptr, prefetchSize);
 	}
-#ifdef NGT_VISIT_COUNT
-	sc.visitCount++;
-#endif
-	auto &neighbor = *neighborptr;
-        distanceChecked.insert(neighbor.first);
 
 #ifdef NGT_DISTANCE_COMPUTATION_COUNT
 	sc.distanceComputationCount++;
 #endif
 	Distance distance = COMPARATOR::compare((void*)&sc.object[0], 
-						(void*)&(*static_cast<PersistentObject*>(neighbor.second))[0], dimension);
+						(void*)&(*static_cast<PersistentObject*>(neighborptr->second))[0], dimension);
 	if (distance <= explorationRadius) {
-	  result.set(neighbor.first, distance);
+	  result.set(neighborptr->first, distance);
 	  unchecked.push(result);
 	  if (distance <= sc.radius) {
 	    results.push(result);
-	    if (results.size() >= sc.size) {
-	      if (results.size() > sc.size) {
-	        results.pop();
-	      }
+	    if (results.size() > sc.size) {
+	      results.pop();
 	      sc.radius = results.top().distance;
 	      explorationRadius = sc.explorationCoefficient * sc.radius;
 	    } 
@@ -805,7 +801,7 @@ NeighborhoodGraph::setupSeeds(NGT::SearchContainer &sc, ObjectDistances &seeds, 
 	}
 	if (insertionA != insertionB) {
 	  stringstream msg;
-	  msg << "Graph::removeEdgeReliably:Warning. Lost conectivity! Isn't this ANNG? ID=" << id << ".";
+	  msg << "Graph::removeEdgeReliably:Warning. Lost connectivity! Isn't this ANNG? ID=" << id << ".";
 #ifdef NGT_FORCED_REMOVE
 	  msg << " Anyway continue...";
 	  cerr << msg.str() << endl;

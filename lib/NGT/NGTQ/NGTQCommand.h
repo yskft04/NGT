@@ -59,6 +59,7 @@ public:
 	switch(centroidCreationMode) {
 	case 'd': property.centroidCreationMode = NGTQ::CentroidCreationModeDynamic; break;
 	case 's': property.centroidCreationMode = NGTQ::CentroidCreationModeStatic; break;
+	case 'l': property.centroidCreationMode = NGTQ::CentroidCreationModeStaticLayer; break;
 	default:
 	  std::stringstream msg;
 	  msg << "Command::CreateParameters: Error: Invalid centroid creation mode. " << centroidCreationMode;
@@ -77,7 +78,10 @@ public:
 	  NGTThrowException(msg);
 	}
       }
-
+#ifdef NGTQ_LQBG
+      property.localIDByteSize = args.getl("B", 0);
+#endif
+      
       globalProperty.edgeSizeForCreation = args.getl("E", 10);
       globalProperty.edgeSizeForSearch = args.getl("S", 40);
       {
@@ -129,7 +133,7 @@ public:
       "[-p #-of-thread] [-R global-codebook-range] [-r local-codebook-range] "
       "[-C global-codebook-size-limit] [-c local-codebook-size-limit] [-N local-division-no] "
       "[-T single-local-centroid (t|f)] [-e epsilon] [-i index-type (t:Tree|g:Graph)] "
-      "[-M global-centroid-creation-mode (d|s)] [-L global-centroid-creation-mode (d|k|s)] "
+      "[-M global-centroid-creation-mode (d|s)] [-L local-centroid-creation-mode (d|k|s)] "
       "[-s local-sample-coefficient] "
       "index(output) data.tsv(input)";
 
@@ -148,8 +152,10 @@ public:
       cerr << "ngtq: Create" << endl;
       NGTQ::Index::create(createParameters.index, createParameters.property, createParameters.globalProperty, createParameters.localProperty);
 
-      cerr << "ngtq: Append" << endl;
-      NGTQ::Index::append(createParameters.index, createParameters.objectPath, createParameters.numOfObjects);
+      if (!createParameters.objectPath.empty()) {
+	cerr << "ngtq: Append" << endl;
+	NGTQ::Index::append(createParameters.index, createParameters.objectPath, createParameters.numOfObjects);
+      }
     } catch(NGT::Exception &err) {
       std::cerr << err.what() << std::endl;
       cerr << usage << endl;
@@ -184,7 +190,7 @@ public:
     {
       NGTQ::Index index(srcIndex);
       property = index.getQuantizer().property;
-      index.getQuantizer().globalCodebook.getProperty(globalProperty);
+      index.getQuantizer().globalCodebookIndex.getProperty(globalProperty);
       index.getQuantizer().getLocalCodebook(0).getProperty(localProperty);
     }
 
@@ -265,7 +271,31 @@ public:
     }
 
     NGTQ::Index::append(index, data, dataSize);
+  }
 
+  void 
+  build(NGT::Args &args)
+  {
+    const string usage = "Usage: ngtq build index";
+    string indexPath;
+    try {
+      indexPath = args.get("#1");
+    } catch (...) {
+      cerr << "DB is not specified." << endl;
+      cerr << usage << endl;
+      return;
+    }
+
+    size_t dataSize = args.getl("n", 0);
+
+    if (debugLevel >= 1) {
+      cerr << "data size=" << dataSize << endl;
+    }
+    NGTQ::Index index(indexPath);
+
+    index.createIndex();
+
+    index.save();
   }
 
   void
@@ -361,14 +391,7 @@ public:
 	     resultExpansion <= endOfResultExpansion; 
 	     base = mulStep ? base * stepOfResultExpansion : base + stepOfResultExpansion) {
 	  resultExpansion = base;
-	  cerr << "size=" << base << ":" << resultExpansion << endl;
 	  NGT::ObjectDistances objects;
-
-	  if (outputMode == 'e') {
-	    index.search(query, objects, size, resultExpansion, aggregationMode, epsilon);
-	    objects.clear();
-	  }
-
 	  NGT::Timer timer;
 	  timer.start();
 	  // size : # of final resultant objects 
@@ -592,6 +615,8 @@ public:
 	create(args);
       } else if (command == "append") {
 	append(args);
+      } else if (command == "build") {
+	build(args);
       } else if (command == "remove") {
 	remove(args);
       } else if (command == "info") {
