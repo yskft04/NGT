@@ -20,14 +20,14 @@ using namespace std;
 
 class Loader {
 public:
-  Loader(const std::string &path) {
-    if (path.find(".u8bin") != std::string::npos) {
+  Loader(const std::string &path, std::string t = "") {
+    if (path.find(".u8bin") != std::string::npos || t == "uint8") {
       std::cerr << "type=u8bin" << std::endl;
       type = "u8";
-    } else if (path.find(".i8bin") != std::string::npos) {
+    } else if (path.find(".i8bin") != std::string::npos || t == "int82") {
       std::cerr << "type=i8bin" << std::endl;
       type = "i8";
-    } else if (path.find(".fbin") != std::string::npos) {
+    } else if (path.find(".fbin") != std::string::npos || t == "float32") {
       std::cerr << "type=fbin" << std::endl;
       type = "f";
     } else {
@@ -166,9 +166,10 @@ void extract(NGT::Args &args)
 
   size_t n = args.getl("n", 100);
   size_t dim = args.getl("d", 0);
+  std::string type = args.getString("t", "float32");
   
   try {
-    Loader loader(objectPath);
+    Loader loader(objectPath, type);
 
     size_t cnt = 0;
     while (!loader.isEmpty()) {

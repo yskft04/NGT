@@ -1308,7 +1308,7 @@ void subclustering(std::vector<NGT::Clustering::Cluster> &upperClusters, size_t 
 	  exit(1);
 	}
 	if (!objectList.get(threadid, m.vectorID + 1, obj, &objectSpace)) {
-	  std::cerr << "subclustering: Fatal error! cannot get!!!!" << std::endl;
+	  std::cerr << "subclustering: Fatal error! cannot get!!!! " << m.vectorID + 1 << std::endl;
 	  abort();
 	}
 	partialVectors.push_back(objectSpace.getObject(obj));

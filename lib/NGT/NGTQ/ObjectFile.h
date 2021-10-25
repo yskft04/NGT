@@ -109,13 +109,14 @@ bool ObjectFile<TYPE>::create(const std::string &file, const std::string &object
     tmpstream.open(file);
     std::vector<std::string> tokens;
     NGT::Common::tokenize(objectPath, tokens, ".");
-    if (tokens.size() <= 1) {
-      std::cerr << "The specifiled object file name has no proper extensions. " << objectPath << std::endl;
-      abort();
-    }
     tmpstream << _fileHead.noOfObjects << std::endl;
     tmpstream << _fileHead.noOfDimensions << std::endl;
-    tmpstream << tokens.back() << std::endl;
+    if (tokens.size() <= 1) {
+      std::cerr << "The specifiled object file name has no proper extensions. " << objectPath << " use fbin." << std::endl;
+      tmpstream << "fbin" << std::endl;
+    } else {
+      tmpstream << tokens.back() << std::endl;
+    }
     tmpstream << objectPath << std::endl;
   }
   return true;
@@ -149,6 +150,9 @@ bool ObjectFile<TYPE>::open(const std::string &file, size_t pseudoDimension) {
   } else if (_typeName == "i8bin") {
     _sizeOfElement = 1;
     _type = TypeInt8;
+  } else {
+    _sizeOfElement = 4;
+    _type = TypeFloat;
   }
 
   _stream.open(_objectPath, std::ios::in);
@@ -177,7 +181,7 @@ bool ObjectFile<TYPE>::multipleOpen(const size_t nOfStreams) {
     return false;
   }
   if (!_objectFiles.empty()) {
-    std::cerr << "ObjectFile : already opened multiple streams. close and reopen." << std::endl;
+    std::cerr << "ObjectFile : already opened multiple streams. close and reopen. # of streams=" << nOfStreams << std::endl;
     multipleClose();
   }
   for (size_t i = 0; i < nOfStreams; i++) {
@@ -243,9 +247,6 @@ bool ObjectFile<TYPE>::get(size_t id, TYPE &data, NGT::ObjectSpace *objectSpace)
 	if (_recordSize > dim * sizeof(float)) {
 	  abort();
 	}
-	if (dim == 0) {
-	  dim = _recordSize;
-	}
 	std::vector<float> record(dim);
 	_stream.read(reinterpret_cast<char*>(record.data()), _recordSize);
 	std::stringstream object;
@@ -280,9 +281,8 @@ bool ObjectFile<TYPE>::get(size_t id, TYPE &data, NGT::ObjectSpace *objectSpace)
       }
       break;
     }
-  }
-  if (_stream.fail()) {
-    std::cerr << "ObjectFile::get something wrong!" << std::endl;
+  } else {
+    std::cerr << "ObjectFile::get something wrong! id=" << id << " type=" << _type << std::endl;
     abort();
 #if 0
 
