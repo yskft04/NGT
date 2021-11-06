@@ -159,7 +159,7 @@ generate_R_and_local_codebooks_from_kmeans() {
     fi
     OPTR="${OPT_DIR}/opt_R.tsv"
     if [ ! -f ${OPT_DIR}/opt-0_centroid.tsv ]; then
-	COM="$OPQ -L 24 -M 5 -S 0.02 -X $R_STEP -R 0.9 -e r -H ${R_SAMPLE} -n 16 -m ${NUM_OF_SUBVECTORS} -I $CITER -i $SEED -O t -s f -C $CMODE -t $ITER ${RANDOM_OBJECT} ${OPT_DIR}/opt.tsv $GC"
+	COM="$OPQ -L 24 -M $R_N -S 0.02 -X $R_STEP -R 0.9 -e r -H ${R_SAMPLE} -n 16 -m ${NUM_OF_SUBVECTORS} -I $CITER -i $SEED -O t -s f -C $CMODE -t $ITER ${RANDOM_OBJECT} ${OPT_DIR}/opt.tsv $GC"
 	execute "$COM" opq.log
 	CUTLAST=`expr ${NUM_OF_SUBVECTORS} - 1`
 	for IDX in `seq 0 $CUTLAST`
@@ -309,12 +309,14 @@ BLOB_SAMPLE=0
 SAMPLE=0
 DATASET=dataset
 R_ITERATION=20
+R_N=5
 BINOBJECTS=
 NUM_OF_CLUSTERS=10
 NUM_OF_RANDOM_OBJECTS=2
 RANDOM_OBJECTS_MODE=c
 QUANTIZATION_SAMPLE_EXPANSION=50
 
+NGT_ROOT=.
 NGTLQG=./ngtlqg
 NGTC=./ngtc
 NGT=./ngt
@@ -359,6 +361,9 @@ while [ $# -gt 0 ]; do
 	    ;;
 	--#-of-blob-samples=* | -B=*)
 	    BLOB_SAMPLE="${1#*=}"
+	    ;;
+	--#-of-r-matrices=* | -N=*)
+	    R_N="${1#*=}"
 	    ;;
 	--#-of-r-samples=* | -r=*)
 	    R_SAMPLE="${1#*=}"
@@ -418,7 +423,6 @@ if [ -n "$BENCHMARK" ]; then
 	exit 1
     fi
 else
-    NGT_ROOT=.
     DATASET_BASE=${DATASET}/${BASE}
 fi
 LOG_ROOT=${NGT_ROOT}/logs
@@ -456,8 +460,10 @@ if [ -n "$BENCHMARK" ]; then
     fi
 fi
 
-LOG=${LOG_ROOT}/log.$$
-rm -f $LOG
+if [ ! -d $NGT_ROOT ]; then
+    echo "Create the NGT root directory. $NGT_ROOT"
+    mkdir $NGT_ROOT
+fi
 if [ ! -d $WORKSPACE_ROOT ]; then
     echo "Create the workspace directory. $WORKSPACE_ROOT"
     mkdir $WORKSPACE_ROOT
@@ -470,6 +476,9 @@ if [ ! -d $RESULT_ROOT ]; then
     echo "Create the result directory. $RESULT_ROOT"
     mkdir $RESULT_ROOT
 fi
+
+LOG=${LOG_ROOT}/log.$$
+rm -f $LOG
 
 generate_data
 
@@ -507,12 +516,13 @@ fi
 HOST=`hostname --short`
 TITLE="@EVAL@	$HOST	$TITLE"
 CUTBACK=0.0
-MAX_NUM_OF_BLOBS=100
-for NUM_OF_EDGES in 20
+NUM_OF_EDGES=100
+#MAX_NUM_OF_BLOBS=100
+for MAX_NUM_OF_BLOBS in 10000
 do
-    for EPSILON in 0.0 0.06 0.1 0.12 0.14 0.16 0.18 0.20 0.25 0.30
+    for EPSILON in 0.0 0.06 0.1 0.12 0.14 0.16 0.18 0.20 0.25 0.30 0.35 0.40 0.50 0.60
     do
-	COM="$NGTLQG search -M g -o e -n 10 -N $MAX_NUM_OF_BLOBS -e $EPSILON -E ${NUM_OF_EDGES} -C $CUTBACK $INDEX ${DATASET}/${QUERY}.tsv"
+	COM="$NGTLQG search -M g -o e -n 10 -N $MAX_NUM_OF_BLOBS -B 0.0 -e $EPSILON -E ${NUM_OF_EDGES} -C $CUTBACK $INDEX ${DATASET}/${QUERY}.tsv"
 	execute_search "$COM" $SEARCH_RESULT
 	$NGT eval -m a -t "$TITLE	${NUM_OF_EDGES}	$MAX_NUM_OF_BLOBS	$CUTBACK" ${DATASET}/${QUERY}-$NSTR.gt $SEARCH_RESULT
     done

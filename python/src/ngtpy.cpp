@@ -625,6 +625,7 @@ public:
     withDistance = true;;
     defaultNumOfSearchObjects = 20;
     defaultEpsilon = 0.02;
+    defaultBlobEpsilon = 0.0;
     defaultResultExpansion = 3.0;
     defaultEdgeSize = -2;
     defaultExplorationSize = 200;
@@ -654,9 +655,10 @@ py::array_t<uint32_t> batchSearchTmp(
       NGTLQG::SearchContainer sc(queryObject);
       sc.setSize(size);
       sc.setEpsilon(defaultEpsilon);
+      sc.setBlobEpsilon(defaultBlobEpsilon);
       sc.setEdgeSize(defaultEdgeSize);
       sc.setGraphExplorationSize(defaultExplorationSize);
-      NGTLQG::Index::searchGraphExploration(sc);
+      NGTLQG::Index::searchBlobGraph(sc);
       NGT::ResultPriorityQueue &r = sc.getWorkingResult();
       if (r.size() != size) {
 	std::cerr << "result size is invalid? " << r.size() << ":" << size << std::endl;
@@ -679,8 +681,8 @@ py::array_t<uint32_t> batchSearchTmp(
     const py::buffer_info &qinfo = queries.request();
     const std::vector<long int> &qshape = qinfo.shape;
     auto nOfQueries = qshape[0];
-    auto dimension = qshape[1];
-    auto psedoDimension = NGTLQG::Index::getQuantizer().globalCodebookIndex.getObjectSpace().getPaddedDimension();
+    size_t dimension = qshape[1];
+    size_t psedoDimension = NGTLQG::Index::getQuantizer().globalCodebookIndex.getObjectSpace().getPaddedDimension();
     auto *queryPtr = static_cast<float*>(qinfo.ptr);
 
     size	= size > 0 ? size : defaultNumOfSearchObjects;
@@ -700,9 +702,10 @@ py::array_t<uint32_t> batchSearchTmp(
       NGTLQG::SearchContainer sc(queryObject);
       sc.setSize(size);
       sc.setEpsilon(defaultEpsilon);
+      sc.setBlobEpsilon(defaultBlobEpsilon);
       sc.setEdgeSize(defaultEdgeSize);
       sc.setGraphExplorationSize(defaultExplorationSize);
-      NGTLQG::Index::searchGraphExploration(sc);
+      NGTLQG::Index::searchBlobGraph(sc);
       results.results[idx] = std::move(sc.getWorkingResult());
     }
     results.size = results.results.size();
@@ -717,8 +720,8 @@ py::array_t<uint32_t> batchSearchTmp(
     const py::buffer_info &qinfo = queries.request();
     const std::vector<long int> &qshape = qinfo.shape;
     auto nOfQueries = qshape[0];
-    auto dimension = qshape[1];
-    auto psedoDimension = NGTLQG::Index::getQuantizer().globalCodebookIndex.getObjectSpace().getPaddedDimension();
+    size_t dimension = qshape[1];
+    size_t psedoDimension = NGTLQG::Index::getQuantizer().globalCodebookIndex.getObjectSpace().getPaddedDimension();
     auto *queryPtr = static_cast<float*>(qinfo.ptr);
 
     size	= size > 0 ? size : defaultNumOfSearchObjects;
@@ -741,9 +744,10 @@ py::array_t<uint32_t> batchSearchTmp(
       sc.setSize(static_cast<float>(size) * defaultExactResultExpansion);
       sc.setExactResultSize(size);
       sc.setEpsilon(defaultEpsilon);
+      sc.setBlobEpsilon(defaultBlobEpsilon);
       sc.setEdgeSize(defaultEdgeSize);
       sc.setGraphExplorationSize(defaultExplorationSize);
-      NGTLQG::Index::searchGraphExploration(sc);
+      NGTLQG::Index::searchBlobGraph(sc);
       results.resultList[idx] = std::move(rs);
     }
     results.size = results.resultList.size();
@@ -786,9 +790,10 @@ py::array_t<uint32_t> batchSearchTmp(
       sc.setSize(1000000);
       sc.setRadius(radius);
       sc.setEpsilon(defaultEpsilon);
+      sc.setBlobEpsilon(defaultBlobEpsilon);
       sc.setEdgeSize(defaultEdgeSize);
       sc.setGraphExplorationSize(defaultExplorationSize);
-      NGTLQG::Index::searchGraphExploration(sc);
+      NGTLQG::Index::searchBlobGraph(sc);
       NGT::ResultPriorityQueue &r = sc.getWorkingResult();
       if (r.size() != size) {
 	std::cerr << "result size is invalid? " << r.size() << ":" << size << std::endl;
@@ -820,8 +825,9 @@ py::array_t<uint32_t> batchSearchTmp(
       epsilon		= epsilon > -1.0 ? epsilon : defaultEpsilon;
       sc.setSize(size);				// the number of resulting objects.
       sc.setEpsilon(epsilon);			// set exploration coefficient.
+      sc.setBlobEpsilon(defaultBlobEpsilon);
       std::cerr << "ngtpy search" << std::endl;
-      NGTLQG::Index::searchGraphExploration(sc);
+      NGTLQG::Index::searchBlobGraph(sc);
 
       NGTLQG::Index::getQuantizer().globalCodebookIndex.deleteObject(qobject);
       numOfDistanceComputations += sc.distanceComputationCount;
@@ -880,6 +886,7 @@ py::array_t<uint32_t> batchSearchTmp(
   void set(
    size_t numOfSearchObjects, 		// the number of resultant objects
    float epsilon,	 		// search parameter epsilon. the adequate range is from 0.0 to 0.05.
+   float blobEpsilon,	 		// search parameter blob epsilon. the recommended value is 0.0.
    float resultExpansion,		// the number of inner resultant objects
    float radius,
    int edgeSize,
@@ -888,6 +895,7 @@ py::array_t<uint32_t> batchSearchTmp(
   ) {
     defaultNumOfSearchObjects = numOfSearchObjects > 0 ? numOfSearchObjects : defaultNumOfSearchObjects;
     defaultEpsilon	      = epsilon > -1.0 ? epsilon : defaultEpsilon;
+    defaultBlobEpsilon	      = blobEpsilon > -1.0 ? blobEpsilon : defaultBlobEpsilon;
     defaultResultExpansion    = resultExpansion >= 0.0 ? resultExpansion : defaultResultExpansion;
     defaultEdgeSize	      = edgeSize >= -2 ? edgeSize : defaultEdgeSize;
     defaultExplorationSize    = explorationSize > 0 ? explorationSize : defaultExplorationSize;
@@ -901,6 +909,7 @@ py::array_t<uint32_t> batchSearchTmp(
   bool		withDistance;
   size_t	defaultNumOfSearchObjects; // k
   float		defaultEpsilon;
+  float		defaultBlobEpsilon;
   float		defaultResultExpansion;
   int64_t	defaultEdgeSize;
   size_t	defaultExplorationSize;
@@ -1078,6 +1087,7 @@ PYBIND11_MODULE(ngtpy, m) {
       .def("set", &::QuantizedBlobIndex::set,
            py::arg("num_of_search_objects") = 0,
            py::arg("epsilon") = -FLT_MAX,
+           py::arg("blob_epsilon") = -FLT_MAX,
            py::arg("result_expansion") = -FLT_MAX,
            py::arg("radius") = -FLT_MAX,
 	   py::arg("edge_size") = INT_MIN,

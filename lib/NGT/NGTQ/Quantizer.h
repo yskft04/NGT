@@ -2595,7 +2595,7 @@ public:
     size_t paddedDimension = globalCodebookIndex.getObjectSpace().getPaddedDimension();
     size_t localCodebookNo = property.getLocalCodebookNo();
     bool localCodebookFull = true;  
-//#pragma omp parallel for
+#pragma omp parallel for
     for (size_t li = 0; li < localCodebookNo; ++li) {
       float lr = property.localRange;
       size_t localCentroidLimit = property.localCentroidLimit;
@@ -2681,7 +2681,6 @@ public:
     size_t paddedDimension = globalCodebookIndex.getObjectSpace().getPaddedDimension();
     size_t localCodebookNo = property.getLocalCodebookNo();
     size_t codebookSize = property.localCentroidLimit;
-    size_t dimension = globalCodebookIndex.getObjectSpace().getDimension();
     if (property.dimension % property.localDivisionNo != 0) {
       std::cerr << "setMultipleLocalCodeToInvertedIndexEntry!!!" << std::endl;
       abort();
@@ -2694,7 +2693,6 @@ public:
       abort();
     }
     {
-      size_t oft = 0;
 #pragma omp parallel for
       for (size_t idx = 0; idx < localData.size(); idx++) {
 	for (size_t cid = 0; cid < codebookSize; cid++) {
@@ -2715,8 +2713,6 @@ public:
 	}
       }
 
-
-      
     }
 #pragma omp parallel for
     for (size_t li = 0; li < localCodebookNo; ++li) {
@@ -2860,17 +2856,6 @@ public:
     vector<vector<pair<NGT::Object*, size_t>>> localObjs;
     localObjs.resize(property.getLocalCodebookNo());	
     for (size_t i = 0; i < localData.size(); i++) {
-#if 0
-      {
-	std::cerr << "A:" << i << ":";
-	auto o = globalCodebookIndex.getObjectSpace().getObject(*objects[i].first);
-	for (auto &v : o) {
-	  std::cerr << v << " ";
-	}
-	std::cerr << std::endl;
-      }
-#endif
-      IIEntry &invertedIndexEntry = *invertedIndex.at(localData[i].iiIdx);
 #ifdef NGTQ_SHARED_INVERTED_INDEX
       (*generateResidualObject)(invertedIndexEntry.at(localData[i].iiLocalIdx, invertedIndex.allocator).id,
 				localData[i].iiIdx, // centroid:ID of global codebook
@@ -2936,14 +2921,12 @@ public:
 #pragma omp parallel for 
     for (size_t idx = 0; idx < objects.size(); idx++) {
       auto qid = quantizationCodebook.search(*objects[idx].first);
-      //std::cerr << "qid=" << qid << std::endl;
       NGT::ObjectDistances result;
       if (gqindex != 0) {
 	std::vector<float> object(globalCodebookIndex.getObjectSpace().getDimension());
 	memcpy(object.data(), objects[idx].first->getPointer(), sizeof(float) * object.size());
 #define QID_WEIGHT	100	
 	object.push_back(qid * QID_WEIGHT);
-	//NGT::SearchContainer sc(*objects[idx].first);
 	NGT::SearchQuery sc(object);;
 	sc.setResults(&result);
 	sc.setSize(50);
@@ -2956,7 +2939,6 @@ public:
 	sc.setSize(50);
 	sc.radius = FLT_MAX;
 	sc.setEpsilon(0.1);
-	//timer.start();
 	globalCodebookIndex.search(sc);
       }
       int32_t eqi = -1;
@@ -2979,7 +2961,6 @@ public:
       ids[idx].distance = result[eqi].distance;
       ids[idx].identical = true;
     }
-    std::cerr << "searchIndex: Found=" << foundCount << "/" << objects.size() << " rank=" << foundRank / foundCount << std::endl;
     return;
 
   }
@@ -3088,7 +3069,6 @@ public:
       }
 #endif
       (*generateResidualObject)(*objects[i].first, // object
-				//localData[i].iiIdx, // global centroid ID
 				invertedIndexEntry.subspaceID,
 				subspaceObjects[i]); // subspace objects
 #ifndef NGTQG_ROTATED_GLOBAL_CODEBOOKS
@@ -3195,7 +3175,6 @@ void insert(const string &line, vector<pair<NGT::Object*, size_t> > &objects, si
     if (endID == 0) {
       endID = objectList.size() - 1;
     }
-    bool localCodebookEnabled = false;
     NGT::Timer timer;
     timer.start();
     for (size_t id = beginID; id <= endID; id++) {
@@ -3208,12 +3187,10 @@ void insert(const string &line, vector<pair<NGT::Object*, size_t> > &objects, si
       objectList.get(id, *object, &globalCodebookIndex.getObjectSpace());
       objects.push_back(pair<NGT::Object*, size_t>(object, id));
       if (objects.size() >= property.batchSize) {
-	//insert(objects);   // batch insert
 	insertLQG(objects, gqindex);   // batch insert
       }
     }
     if (objects.size() > 0) {
-      //insert(objects);   // batch insert
       insertLQG(objects, gqindex);   // batch insert
     }
     delete gqindex;
@@ -3222,7 +3199,6 @@ void insert(const string &line, vector<pair<NGT::Object*, size_t> > &objects, si
   void setupInvertedIndexForLQG(std::vector<std::vector<float>> &qCodebook,
 				std::vector<uint32_t> &codebookIndex,
 				std::vector<uint32_t> &objectIndex) {
-    //IIEntry &invertedIndexEntry = *invertedIndex.at(localData[i].iiIdx);
     if (globalCodebookIndex.getObjectRepositorySize() != codebookIndex.size() + 1) {
       std::cerr << "Fatal Error? " << globalCodebookIndex.getObjectRepositorySize() << ":" <<  codebookIndex.size() + 1 << std::endl;
     }

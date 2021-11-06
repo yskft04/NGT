@@ -61,7 +61,7 @@ public:
 
   Matrix<T> &operator=(const Matrix<T> &m) { 
     allocate(m.row, m.col); 
-    std:memcpy(matrix, m.matrix, row * col * sizeof(T));
+    std::memcpy(matrix, m.matrix, row * col * sizeof(T));
     return *this;
   }
 
@@ -113,7 +113,7 @@ public:
       return;
     }
     size_t l = row * col;
-    for (int p = 0; p < l; p++) {
+    for (size_t p = 0; p < l; p++) {
       matrix[p] = *v++;
     }
   }
@@ -123,7 +123,7 @@ public:
       return;
     }
     size_t l = row * col;
-    for (int p = 0; p < l; p++) {
+    for (size_t p = 0; p < l; p++) {
       matrix[p] = *v++;
     }
   }
@@ -133,16 +133,16 @@ public:
 #ifdef BLAS_MATRIX
     assert(row == v[0].size());
     assert(col == v.size());
-    for (int c = 0; c < col; c++) {
-      for (int r = 0; r < row; r++) {
+    for (size_t c = 0; c < col; c++) {
+      for (size_t r = 0; r < row; r++) {
 	*m++ = v[c][r];
       }
     }
 #else
     assert(row == v.size());
     assert(col == v[0].size());
-    for (int r = 0; r < row; r++) {
-      for (int c = 0; c < col; c++) {
+    for (size_t r = 0; r < row; r++) {
+      for (size_t c = 0; c < col; c++) {
 	*m++ = v[r][c];
       }
     }
@@ -150,9 +150,9 @@ public:
   }
 
   void put(size_t pr, size_t pc, const Matrix<T> &m) {
-    for (int r = 0; r < m.row; r++) {
+    for (size_t r = 0; r < m.row; r++) {
       if (pr + r < row) {
-	for (int c = 0; c < m.col; c++) {
+	for (size_t c = 0; c < m.col; c++) {
 	  if (pc + c < col) {
 	    matrix[(pr + r) * col + (pc + c)] = m.matrix[r * m.col + c];
 	  }
@@ -165,8 +165,8 @@ public:
     assert(row == m.row);
     size_t nc = col + m.col;
     T *mtx = new T[row * nc];
-    for (int r = 0; r < row; r++) {
-      for (int c = 0; c < col; c++) {
+    for (size_t r = 0; r < row; r++) {
+      for (size_t c = 0; c < col; c++) {
 	mtx[r * nc + c] = matrix[r * col + c];
       }
     }
@@ -184,8 +184,8 @@ public:
     assert(col == m.col);
     size_t nr = row + m.row;
     T *mtx = new T[nr * col];
-    for (int r = 0; r < row; r++) {
-      for (int c = 0; c < col; c++) {
+    for (size_t r = 0; r < row; r++) {
+      for (size_t c = 0; c < col; c++) {
 	mtx[r * col + c] = matrix[r * col + c];
       }
     }
@@ -202,7 +202,7 @@ public:
 
   void zero() {
     size_t l = row * col;
-    for (int p = 0; p < l; p++) {
+    for (size_t p = 0; p < l; p++) {
       matrix[p] = 0.0;
     }
   }
@@ -240,15 +240,15 @@ public:
     size_t nr = col;
     size_t nc = row;
 #ifdef BLAS_MATRIX
-    for (int r = 0; r < nr; r++) {
-      for (int c = 0; c < nc; c++) {
+    for (size_t r = 0; r < nr; r++) {
+      for (size_t c = 0; c < nc; c++) {
 	m[c * nr + r] = *msrc++;
 	//std::cerr << r * nc + c << std::endl;
       }
     }
 #else
-    for (int c = 0; c < nc; c++) {
-      for (int r = 0; r < nr; r++) {
+    for (size_t c = 0; c < nc; c++) {
+      for (size_t r = 0; r < nr; r++) {
 	m[r * nc + c] = *msrc++;
 	//std::cerr << r * nc + c << std::endl;
       }
@@ -322,18 +322,18 @@ public:
     size_t nr = row;
     size_t nc = mtx.col;
     T *tmpmtx = new T[nr * nc];
-    for (int r = 0; r < nr; r++) {
-      for (int c = 0; c < nc; c++) {
+    for (size_t r = 0; r < nr; r++) {
+      for (size_t c = 0; c < nc; c++) {
 #ifdef BLAS_MATRIX
 	T &sum = tmpmtx[c * nr + r];
 	sum = 0;
-	for (int p = 0; p < col; p++) {
+	for (size_t p = 0; p < col; p++) {
 	  sum += matrix[p * row + r] * mtx.matrix[c * mtx.row + p];
 	}
 #else
 	T &sum = tmpmtx[r * nc + c];
 	sum = 0;
-	for (int p = 0; p < col; p++) {
+	for (size_t p = 0; p < col; p++) {
 	  sum += matrix[r * col + p] * mtx.matrix[p * mtx.col + c];
 	}
 #endif
@@ -371,14 +371,14 @@ public:
       m[i] = 0.0;
     }
 #ifdef BLAS_MATRIX
-    for (int sc = 0; sc < col; sc++) {
-      for (int sr = 0; sr < row; sr++) {
+    for (size_t sc = 0; sc < col; sc++) {
+      for (size_t sr = 0; sr < row; sr++) {
 	m[sc * r + sr] = matrix[sc * row + sr];
       }
     }
 #else
-    for (int sr = 0; sr < row; sr++) {
-      for (int sc = 0; sc < col; sc++) {
+    for (size_t sr = 0; sr < row; sr++) {
+      for (size_t sc = 0; sc < col; sc++) {
         m[sr * c + sc] = matrix[sr * col + sc];
       }
     }
@@ -403,17 +403,17 @@ public:
 
     std::vector<float> vec;
 #ifdef BLAS_MATRIX
-    for (int c = 0; c < a.size(); c++) {
+    for (size_t c = 0; c < a.size(); c++) {
       T sum = 0;
-      for (int p = 0; p < b.col; p++) {
+      for (size_t p = 0; p < b.col; p++) {
 	sum += a[p] * b.matrix[c * b.row + p];
       }
       vec.push_back(sum);
     }
 #else
-    for (int c = 0; c < a.size(); c++) {
+    for (size_t c = 0; c < a.size(); c++) {
       T sum = 0;
-      for (int p = 0; p < b.col; p++) {
+      for (size_t p = 0; p < b.col; p++) {
 	sum += a[p] * b.matrix[p * b.col + c];
       }
       vec.push_back(sum);
@@ -425,7 +425,7 @@ public:
 
   static void mulSquare(std::vector<std::vector<float>> &a, Matrix<T> &b) {
     assert(b.col == b.row);
-    for (int r = 0; r < a.size(); r++) {
+    for (size_t r = 0; r < a.size(); r++) {
       mulSquare(a[r], b);
     }
   }
@@ -574,9 +574,7 @@ public:
     convert(std::vector<std::string> &strings, std::vector<T> &vector) {
     vector.clear();
     for (auto it = strings.begin(); it != strings.end(); ++it) {
-      //std::cerr << "stod=" << *it << std::endl;
       try {
-	T v = stod(*it);
 	vector.push_back(stod(*it));
       } catch(...) {
 	break;
@@ -614,7 +612,7 @@ public:
       throw std::runtime_error(msg.str().c_str());
     }
     std::string line;
-    int row = 0, col = 0;
+    size_t row = 0, col = 0;
     std::vector<T> tmpv;
     while (getline(is, line)) {
       std::vector<T> v;
@@ -636,7 +634,7 @@ public:
       }
       row++;
 #endif
-      for (int i = 0; i < v.size(); i++) {
+      for (size_t i = 0; i < v.size(); i++) {
 	tmpv.push_back(v[i]);
       }
     }

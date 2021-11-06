@@ -424,7 +424,7 @@ void optimizeRotation(
   minDistortion = DBL_MAX;
 
   int minIt = 0;
-  for (int it = 0; it < iteration; it++) {
+  for (size_t it = 0; it < iteration; it++) {
     vector<vector<float>> xp = vectors;
     Matrix<float>::mulSquare(xp, R);
     float distance = 0.0;
@@ -447,12 +447,12 @@ void optimizeRotation(
 #else
       vector<Cluster> &clusters = localClusters[m];
 #endif
-      size_t reassign;
 #ifdef NGT_CLUSTERING
       NGT::Clustering clustering(initMode, clusteringType, clusterIteration);
       clustering.clusterSizeConstraint = clusterSizeConstraint;
-      reassign = clustering.kmeans(subVectors, numberOfClusters, clusters);
+      clustering.kmeans(subVectors, numberOfClusters, clusters);
 #else
+      size_t reassign;
       if (clusteringType == 'k') {
 	reassign = kmeansClustering(initMode, subVectors, numberOfClusters, clusters, clusterSizeConstraint, 0);
       } else {
@@ -643,17 +643,13 @@ main(int argc, char **argv)
   size_t convergenceLimitTimes = args.getl("c", 5);
   size_t iteration = args.getl("t", 100);
   size_t clusterIteration = args.getl("I", 100);
-  size_t cutSize = args.getl("H", 0);
 
   bool clusterSizeConstraint = false;
   if (args.getChar("s", 'f') == 't') {
     clusterSizeConstraint = true;
   }
 
-  bool optimization = false;
-  if (args.getChar("O", 'f') == 't') {
-    optimization = true;
-  } else {
+  if (args.getChar("O", 'f') != 't') {
     iteration = 1;
   }
 
@@ -690,7 +686,6 @@ main(int argc, char **argv)
     exit(1);
   }
   size_t dim = vectors[0].size();
-  size_t n = vectors.size();
   size_t subvectorSize = dim / numberOfSubspaces;
   if (dim % numberOfSubspaces != 0) {
     cerr << "# of subspaces (m) is illegal. " << numberOfSubspaces << endl;
@@ -712,10 +707,19 @@ main(int argc, char **argv)
   timelimitTimer.start();
   vector<vector<vector<NGT::Clustering::Cluster>>> localClusters;
   vector<double> errors;
+  bool useEye = false;
+  if (nOfMatrices == 0) {
+    useEye = true;
+    nOfMatrices = 1;
+  }
   vector<Matrix<float>> rs(nOfMatrices);
-  std::cerr << "rs.size=" << rs.size() << std::endl;
-  for (auto &r: rs) {
-    r.randomRotation(dim);
+  std::cerr << "opq: # of matrices=" << rs.size() << std::endl;
+  if (useEye) {
+    rs[0].eye(dim);
+  } else {
+    for (auto &r: rs) {
+      r.randomRotation(dim);
+    }
   }
   for (size_t vsize = static_cast<float>(vectors.size()) * sizeSeed; ; vsize *= sizeStep) {
 
@@ -774,7 +778,7 @@ main(int argc, char **argv)
   size_t pos = std::distance(std::find(ofile.rbegin(), ofile.rend(), '.'), ofile.rend()) - 1;
   string of = ofile.substr(0, pos);
   Matrix<float>::save(of + "_R.tsv", minR);
-  for (int m = 0; m < numberOfSubspaces; m++) {
+  for (size_t m = 0; m < numberOfSubspaces; m++) {
     stringstream str;
     str << of << "-" << m << ".tsv";
 #ifdef NGT_CLUSTERING

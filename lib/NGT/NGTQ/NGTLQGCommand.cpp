@@ -131,33 +131,19 @@ NGTLQG::Command::search(NGT::Args &args)
     return;
   }
 
-  int size		= args.getl("n", 20);
+  size_t size		= args.getl("n", 20);
   auto exactResultExpansion	= args.getf("R", 0.0);
   char outputMode	= args.getChar("o", '-');
   float epsilon	= 0.1;
 
-  char mode		= args.getChar("m", '-');
   char searchMode	= args.getChar("M", 'g');
-  NGTQ::AggregationMode aggregationMode;
-  switch (mode) {
-  case 'r': aggregationMode = NGTQ::AggregationModeExactDistanceThroughApproximateDistance; break; // refine
-  case 'e': aggregationMode = NGTQ::AggregationModeExactDistance; break; // refine
-  case 'l': aggregationMode = NGTQ::AggregationModeApproximateDistanceWithLookupTable; break; // lookup
-  case 'c': aggregationMode = NGTQ::AggregationModeApproximateDistanceWithCache; break; // cache
-  case '-':
-  case 'a': aggregationMode = NGTQ::AggregationModeApproximateDistance; break; // cache
-  default: 
-    cerr << "Invalid aggregation mode. " << mode << endl;
-    cerr << usage << endl;
-    return;
-  }
-
   if (args.getString("e", "none") == "-") {
     // linear search
     epsilon = FLT_MAX;
   } else {
     epsilon = args.getf("e", 0.1);
   }
+  float blobEpsilon = args.getf("B", 0.0);
   size_t edgeSize = args.getl("E", 0);
   float cutback = args.getf("C", 0.0);
   size_t explorationSize = args.getf("N", 256);
@@ -233,19 +219,20 @@ NGTLQG::Command::search(NGT::Args &args)
 	  searchContainer.setExactResultSize(0);
 	}
 	searchContainer.setEpsilon(epsilon);
+	searchContainer.setBlobEpsilon(blobEpsilon);
 	searchContainer.setEdgeSize(edgeSize);
 	searchContainer.setCutback(cutback);
 	searchContainer.setGraphExplorationSize(explorationSize);
 	switch (searchMode) {
 	case 'b':
-	  index.searchBlobExploration(searchContainer);
+	  index.searchBlobGraphNaively(searchContainer);
 	  break;
 	case 'g':
-	  index.searchGraphExploration(searchContainer);
+	  index.searchBlobGraph(searchContainer);
 	  break;
 	case 's':
 	default:
-	  index.searchStraightforward(searchContainer);
+	  index.searchBlobNaively(searchContainer);
 	  break;
 	}
 	if (objects.size() > size) {
@@ -484,7 +471,7 @@ NGTLQG::Command::expand(NGT::Args &args)
 	searchContainer.setSize(k);
 	searchContainer.setEpsilon(epsilon);
 	searchContainer.setResults(&objects);
-	index.searchBlobExploration(searchContainer);
+	index.searchBlobGraphNaively(searchContainer);
 	for (size_t i = 0; i < objects.size(); i++) {
 	  auto dstidx = iviid[objects[i].id];
 	  if (dstidx != idx) {
@@ -564,7 +551,6 @@ NGTLQG::Command::distortion(NGT::Args &args)
 					    subspaceObject); // subspace objects
 	double distortion = 0.0;
 	for (size_t j = 0; j < v.size(); j++) {
-	  //auto d = static_cast<double>(subspaceObject[j]) - static_cast<double>(quantizer.quantizationCodebook.at(ssidx, j));
 	  auto d = static_cast<double>(subspaceObject[j]);
 	  distortion += d * d;
 	}
@@ -579,7 +565,6 @@ NGTLQG::Command::distortion(NGT::Args &args)
   double distortion = 0.0;
   size_t count = 0;
   for (size_t ssidx = 0; ssidx < distortions.size(); ssidx++) {
-    auto d = distortions[ssidx].first / distortions[ssidx].second;
     distortion += distortions[ssidx].first;
     count += distortions[ssidx].second;
   }
@@ -681,13 +666,10 @@ void hierarchicalKmeansSplit(uint32_t id, std::vector<std::vector<float>> &vecto
 
 double computeError(std::vector<HKNode*> &nodes, NGT::ObjectSpace &objectSpace, NGTQ::Quantizer::ObjectList &objectList) {
   std::cerr << "node size=" << nodes.size() << std::endl;
-  size_t clusterCount = 0;
-  size_t objectCount = 0;
   double distance = 0.0;
   size_t dcount = 0;
   for (auto *node : nodes) {
     if (node->leaf) {
-      HKLeafNode &leafNode = static_cast<HKLeafNode&>(*node);
     } else {
       HKInternalNode &internalNode = static_cast<HKInternalNode&>(*node);
       NGT::Object obj(&objectSpace);
@@ -779,8 +761,10 @@ size_t extractIndex(std::ostream &oStream, std::vector<HKNode*> &nodes, size_t n
     oStream << cid << std::endl;
   }
   std::cerr << "# of id=" << count << std::endl;
+  return count;
 }
-size_t extractBtoQAndQCentroid(std::ostream &btoqStream, std::ostream &qStream,
+
+void extractBtoQAndQCentroid(std::ostream &btoqStream, std::ostream &qStream,
 			       std::vector<HKNode*> &nodes, size_t numOfThirdClusters) {
   std::cerr << "extractBtoQ" << std::endl;
   std::vector<int32_t> btoq(numOfThirdClusters);
@@ -828,7 +812,7 @@ size_t extractBtoQAndQCentroid(std::ostream &btoqStream, std::ostream &qStream,
   std::cerr << "object=" << objectCount << std::endl;
 }
 
-size_t extractRandomObjectsFromEachBlob(std::ostream &oStream, std::vector<HKNode*> &nodes, size_t numOfObjects,
+void extractRandomObjectsFromEachBlob(std::ostream &oStream, std::vector<HKNode*> &nodes, size_t numOfObjects,
 					size_t numOfRandomObjects, NGTQ::QuantizerInstance<uint8_t>& quantizer, char rmode) {
   std::cerr << "node size=" << nodes.size() << std::endl;
   std::vector<std::vector<std::vector<float>>> randomObjects(numOfObjects);
@@ -885,7 +869,6 @@ size_t extractRandomObjectsFromEachBlob(std::ostream &oStream, std::vector<HKNod
 	for (auto &child : internalNode.children) {
 	  if (nodes[child.first]->leaf) {
 	    HKLeafNode &leafNode = static_cast<HKLeafNode&>(*nodes[child.first]);
-	    leafNode.id;
 	    centroids[leafNode.id] = child.second;
 	  }
 	}
@@ -1010,7 +993,7 @@ void hierarchicalKmeansBatch(std::vector<uint32_t> &batch, std::vector<pair<uint
     if (leafNode.members.size() > maxSize) {
       auto i = exceededLeaves.begin();
       for (; i != exceededLeaves.end(); i++) {
-	if ((*i).second == nodeIDs[idx]) break;
+	if (static_cast<int32_t>((*i).second) == nodeIDs[idx]) break;
       }
       if (i == exceededLeaves.end()) {
 	exceededLeaves.push_back(std::make_pair(batch[idx], nodeIDs[idx]));
@@ -1707,7 +1690,6 @@ NGTLQG::Command::hierarchicalKmeans(NGT::Args &args)
 	timer.start();
 	std::cerr << "Assign for the third. (" << numOfSecondObjects << "-" << numOfObjects << ")..." << std::endl;
 	::assignWithNGT(secondClusters, numOfSecondObjects + 1, numOfObjects, objectSpace, objectList);
-	//::assign(secondClusters, numOfSecondObjects + 1, numOfObjects, objectSpace, objectList);
 	timer.stop();
 	std::cerr << "Assign(2) time=" << timer << std::endl;
 	std::cerr << "subclustering for the third." << std::endl;
@@ -1860,7 +1842,7 @@ NGTLQG::Command::assign(NGT::Args &args)
 	  linestream >> value;
 	  query.push_back(value);
 	}
-	if (property.dimension != query.size()) {
+	if (static_cast<size_t>(property.dimension) != query.size()) {
 	  std::cerr << "Dimension is invallid. " << property.dimension << ":" << query.size() << std::endl;
 	  return;
 	}

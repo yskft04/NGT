@@ -22,13 +22,25 @@
 namespace NGTLQG {
   class SearchContainer : public NGT::SearchContainer {
   public:
-  SearchContainer(NGT::Object &f): NGT::SearchContainer(f), cutback(0.0), graphExplorationSize(50), exactResultSize(0) {}
+    SearchContainer(NGT::Object &f): NGT::SearchContainer(f),
+      cutback(0.0), graphExplorationSize(50), exactResultSize(0),
+      blobExplorationCoefficient(0.0) {}
+    SearchContainer &operator=(SearchContainer &sc) {
+      NGT::SearchContainer::operator=(sc);
+      cutback = sc.cutback;
+      graphExplorationSize = sc.graphExplorationSize;
+      exactResultSize = sc.exactResultSize;
+      blobExplorationCoefficient = sc.blobExplorationCoefficient;
+      return *this;
+    }
     void setCutback(float c) { cutback = c; }
     void setGraphExplorationSize(size_t size) { graphExplorationSize = size; }
     void setExactResultSize(size_t esize) { exactResultSize = esize; }
-    float cutback;
-    size_t graphExplorationSize;
-    size_t exactResultSize;
+    void setBlobEpsilon(float c) { blobExplorationCoefficient = c + 1.0; }
+    float       cutback;
+    size_t      graphExplorationSize;
+    size_t      exactResultSize;
+    float       blobExplorationCoefficient;
   };
 
   class LargeQuantizedBlobGraphRepository : public NGTQG::QuantizedGraphRepository {
@@ -138,11 +150,7 @@ namespace NGTLQG {
     }
 
     std::tuple<NGT::Distance, NGT::Distance>
-#ifdef NGTLQG_NO_QUANTIZATION
-      judge(NGT::Object &query, NGTQG::QuantizedNode &ivi, size_t k, NGT::Distance radius,
-#else
       judge(NGTQG::QuantizedNode &ivi, size_t k, NGT::Distance radius,
-#endif
 	    NGTQ::QuantizedObjectDistance::DistanceLookupTableUint8 &lut,
 	    NGT::NeighborhoodGraph::ResultSet &result, size_t &foundCount
 	    ) {
@@ -155,52 +163,6 @@ namespace NGTLQG {
       quantizedObjectDistance(ivi.objects, &distances[0], noOfObjects, lut);
 #endif
 
-#ifdef NGTLQG_NO_QUANTIZATION
-      {
-	float error = 0.0;
-	size_t n = 0;
-	size_t c = 0;
-	std::string line1, line2;
-	{
-	  std::ifstream is("NGTLQG_ERROR");
-	  if (is) {
-	    getline(is, line1);
-	    getline(is, line2);
-	  }
-	}
-	std::vector<std::string> tokens;
-	NGT::Common::tokenize(std::string(line1), tokens, ": \t");
-	if (tokens.size() >= 3) {
-	  error = NGT::Common::strtof(tokens[0]);
-	  n = NGT::Common::strtol(tokens[1]);
-	  c = NGT::Common::strtol(tokens[2]);
-	}
-	c++;
-	for (size_t i = 0; i < noOfObjects; i++) {
-	  NGT::Object object(&getQuantizer().globalCodebookIndex.getObjectSpace());
-	  getQuantizer().objectList.get(ivi.ids[i], object,
-					&getQuantizer().globalCodebookIndex.getObjectSpace());
-	  std::vector<float> objectVector;
-	  objectVector = getQuantizer().globalCodebookIndex.getObjectSpace().getObject(object);
-#ifdef NGTQG_ROTATED_GLOBAL_CODEBOOKS
-	  getQuantizer().rotation.mul(objectVector);
-#endif
-	  auto paddedDimension = getQuantizer().globalCodebookIndex.getObjectSpace().getPaddedDimension();
-	  auto d = NGT::PrimitiveComparator::compareL2(static_cast<float*>(query.getPointer()),
-						     static_cast<float*>(objectVector.data()), paddedDimension);
-	  error = (error * n + fabs(distances[i] - d)) / (n + 1);
-	  n++;
-	  distances[i] = d;
-	}
-	std::ofstream os("NGTLQG_ERROR");
-	os << error << " " << n << " " << c << std::endl;
-	if (line2.empty()) {
-	  os << noOfObjects << std::endl;
-	} else {
-	  os << line2 << "," << noOfObjects << std::endl;
-	}
-      }
-#endif
 #ifdef NGTLQG_MIN
       if (distance >= radius) {
 	return std::make_pair(distance, radius);
@@ -228,7 +190,7 @@ namespace NGTLQG {
     }
 
     ///////////////////
-    void searchBlobExploration(NGTLQG::SearchContainer &searchContainer) {
+    void searchBlobGraphNaively(NGTLQG::SearchContainer &searchContainer) {
       NGT::Object *query = &searchContainer.object;
       
       auto &quantizer = getQuantizer();
@@ -260,7 +222,6 @@ namespace NGTLQG {
       quantizedObjectDistance.createDistanceLookup(*query, subspaceID, (*lutfi).second);
 
 #endif
-      size_t noOfObjects = quantizedBlobGraph[seedBlobID].ids.size();
       size_t visitCount = 1;
       size_t foundCount = 0;
 
@@ -271,11 +232,7 @@ namespace NGTLQG {
 #ifdef NGTQG_ZERO_GLOBAL
       std::tie(distance, radius) = judge(quantizedBlobGraph[seedBlobID], k, radius, lut, result);
 #else
-#ifdef NGTLQG_NO_QUANTIZATION
-      std::tie(distance, radius) = judge(*query, quantizedBlobGraph[seedBlobID], k, radius, (*lutfi).second, result, foundCount);
-#else
       std::tie(distance, radius) = judge(quantizedBlobGraph[seedBlobID], k, radius, (*lutfi).second, result, foundCount);
-#endif
 #endif
       NGT::NeighborhoodGraph::UncheckedSet uncheckedBlobs;
       NGT::NeighborhoodGraph::DistanceCheckedSet distanceCheckedBlobs(globalGraph.repository.size());
@@ -293,9 +250,8 @@ namespace NGTLQG {
 	  break;
 	}
 	uncheckedBlobs.pop();
-	auto &targetNode = *globalGraph.NGT::GraphIndex::NeighborhoodGraph::getNode(targetBlob.id);
 	auto *neighbors = nodes[targetBlob.id].data();
-	auto noOfEdges = (searchContainer.edgeSize == 0 || searchContainer.edgeSize > nodes[targetBlob.id].size()) ?
+	auto noOfEdges = (searchContainer.edgeSize == 0 || searchContainer.edgeSize > static_cast<int64_t>(nodes[targetBlob.id].size())) ?
 	                 nodes[targetBlob.id].size() : searchContainer.edgeSize;
 	auto neighborend = neighbors + noOfEdges;
 ;
@@ -309,7 +265,6 @@ namespace NGTLQG {
 #ifdef NGTQG_ZERO_GLOBAL
 	  std::tie(distance, radius) = judge(quantizedBlobGraph[neighborID], k, radius, lut, result);
 #else
-	  uint32_t ssID = quantizedBlobGraph[neighborID].subspaceID;
           auto luti = luts.find(subspaceID);
           if (luti == luts.end()) {
 	    luts.insert(std::make_pair(subspaceID, NGTQ::QuantizedObjectDistance::DistanceLookupTableUint8()));
@@ -317,11 +272,7 @@ namespace NGTLQG {
 	    quantizedObjectDistance.initialize((*luti).second);
 	    quantizedObjectDistance.createDistanceLookup(*query, subspaceID, (*luti).second);
 	  }
-#ifdef NGTLQG_NO_QUANTIZATION
-	  std::tie(distance, radius) = judge(*query, quantizedBlobGraph[neighborID], k, radius, (*luti).second, result, foundCount);
-#else
 	  std::tie(distance, radius) = judge(quantizedBlobGraph[neighborID], k, radius, (*luti).second, result, foundCount);
-#endif
 #endif 
 	  if (static_cast<float>(foundCount) / visitCount < searchContainer.cutback) {
 	    uncheckedBlobs = NGT::NeighborhoodGraph::UncheckedSet();
@@ -344,12 +295,11 @@ namespace NGTLQG {
     }
 
 
-    void searchStraightforward(NGTLQG::SearchContainer &searchContainer) {
+    void searchBlobNaively(NGTLQG::SearchContainer &searchContainer) {
       NGT::Object *query = &searchContainer.object;
       
       auto &quantizer = getQuantizer();
       auto &globalIndex = quantizer.globalCodebookIndex;
-      auto &globalGraph = static_cast<NGT::GraphAndTreeIndex&>(globalIndex.getIndex());
       NGT::ObjectDistances seeds;
       getSeeds(globalIndex, query, seeds, 1000);
       seeds.resize(10);
@@ -364,7 +314,6 @@ namespace NGTLQG {
       quantizedObjectDistance.rotation->mul(static_cast<float*>(query->getPointer()));
 #endif
       std::unordered_map<size_t, NGTQ::QuantizedObjectDistance::DistanceLookupTableUint8> luts;
-      size_t visitCount = 1;
       size_t foundCount = 0;
 
       size_t k = searchContainer.size;
@@ -383,11 +332,7 @@ namespace NGTLQG {
 	  quantizedObjectDistance.initialize((*luti).second);
 	  quantizedObjectDistance.createDistanceLookup(*query, subspaceID, (*luti).second);
 	}
-#ifdef NGTLQG_NO_QUANTIZATION
-	std::tie(distance, radius) = judge(*query, quantizedBlobGraph[blobID], k, radius, (*luti).second, result, foundCount);
-#else
 	std::tie(distance, radius) = judge(quantizedBlobGraph[blobID], k, radius, (*luti).second, result, foundCount);
-#endif
 
       }
 
@@ -401,7 +346,7 @@ namespace NGTLQG {
 
     }
 
-   void searchGraphExploration(NGTLQG::SearchContainer &searchContainer) {
+   void searchBlobGraph(NGTLQG::SearchContainer &searchContainer) {
      auto &globalIndex = getQuantizer().globalCodebookIndex;
      auto &globalGraph = static_cast<NGT::GraphAndTreeIndex&>(globalIndex.getIndex());
      NGT::ObjectDistances	seeds;
@@ -409,10 +354,10 @@ namespace NGTLQG {
      if (seeds.empty()) {
        globalGraph.getRandomSeeds(globalGraph.repository, seeds, 20);
      }
-     searchGraphExploration(searchContainer, seeds);
+     searchBlobGraph(searchContainer, seeds);
    }
 
-   void searchGraphExploration(NGTLQG::SearchContainer &searchContainer, NGT::ObjectDistances &seeds) {
+   void searchBlobGraph(NGTLQG::SearchContainer &searchContainer, NGT::ObjectDistances &seeds) {
 
     auto &quantizer = getQuantizer();
     auto &globalIndex = quantizer.globalCodebookIndex;
@@ -429,25 +374,24 @@ namespace NGTLQG {
     // setup edgeSize
     size_t edgeSize = globalGraph.getEdgeSize(searchContainer);
 
-    NGT::NeighborhoodGraph::UncheckedSet unchecked;
+    NGT::NeighborhoodGraph::UncheckedSet untracedNodes;
 
     NGT::NeighborhoodGraph::DistanceCheckedSet distanceChecked(globalGraph.searchRepository.size());
     NGT::NeighborhoodGraph::ResultSet results;
 
-
     globalGraph.setupDistances(searchContainer, seeds, NGT::PrimitiveComparator::L2Float::compare);
-    globalGraph.setupSeeds(searchContainer, seeds, results, unchecked, distanceChecked);
+    std::sort(seeds.begin(), seeds.end());
+    NGT::ObjectDistance currentNearestBlob = seeds.front();
+    NGT::Distance explorationRadius = searchContainer.blobExplorationCoefficient * currentNearestBlob.distance;
     std::priority_queue<NGT::ObjectDistance, std::vector<NGT::ObjectDistance>, std::greater<NGT::ObjectDistance>> discardedObjects;
-    while (results.size() > 1) {
-      discardedObjects.push(results.top());
-      results.pop();
+    untracedNodes.push(seeds.front());
+    distanceChecked.insert(seeds.front().id);
+    for (size_t i = 1; i < seeds.size(); i++) {
+      untracedNodes.push(seeds[i]);
+      distanceChecked.insert(seeds[i].id);
+      discardedObjects.push(seeds[i]);
     }
-    NGT::ObjectDistance top = results.top();
-    results.pop();
     size_t explorationSize = 1;
-
-    NGT::Distance explorationRadius = searchContainer.explorationCoefficient * top.distance;
-
     auto &quantizedObjectDistance = quantizer.getQuantizedObjectDistance();
     std::unordered_map<size_t, NGTQ::QuantizedObjectDistance::DistanceLookupTableUint8> luts;
     NGT::Object rotatedQuery(&objectSpace);
@@ -464,13 +408,9 @@ namespace NGTLQG {
     pair<uint64_t, NGT::PersistentObject*> *neighborptr;
     pair<uint64_t, NGT::PersistentObject*> *neighborendptr;
     for (;;) {
-      if (!unchecked.empty()) {
-	target = unchecked.top();
-	unchecked.pop();
-      }
-      if (unchecked.empty() || target.distance > explorationRadius) {
+      if (untracedNodes.empty() || untracedNodes.top().distance > explorationRadius) {
 	explorationSize++;
-	auto blobID = top.id;
+	auto blobID = currentNearestBlob.id;
 	auto subspaceID = quantizedBlobGraph[blobID].subspaceID;
 	//if (!availableLUTs[subspaceID]) {
 	auto luti = luts.find(subspaceID);
@@ -482,13 +422,8 @@ namespace NGTLQG {
 	}
 	NGT::Distance blobDistance;
 	size_t foundCount;
-#ifdef NGTLQG_NO_QUANTIZATION
-	std::tie(blobDistance, radius) = judge(quantizedBlobGraph[blobID], requestedSize,
-					   radius, (*luti).second, results, foundCount);
-#else
 	std::tie(blobDistance, radius) = judge(quantizedBlobGraph[blobID], requestedSize, 
 					       radius, (*luti).second, results, foundCount);
-#endif 
 
 #ifdef NGTLQG_MIN
 	if (blobDistance > radius * searchContainer.explorationCoefficient) {
@@ -499,15 +434,17 @@ namespace NGTLQG {
 	  break;
 	}
 	if (discardedObjects.empty()) {
-	  //std::cerr << "discarded empty" << std::endl; ////-/
 	  break;
 	}
-	top = discardedObjects.top();
+	currentNearestBlob = discardedObjects.top();
 	discardedObjects.pop();
-	explorationRadius = searchContainer.explorationCoefficient * top.distance;
-	unchecked.push(top);
+	explorationRadius = searchContainer.blobExplorationCoefficient * currentNearestBlob.distance;
 	continue;
       }
+
+      target = untracedNodes.top();
+      untracedNodes.pop();
+
 
       neighbors = &nodes[target.id];
       neighborptr = &(*neighbors)[0];
@@ -553,19 +490,15 @@ namespace NGTLQG {
 	searchContainer.distanceComputationCount++;
 #endif
 
-	NGT::Distance distance = NGT::PrimitiveComparator::L2Float::compare((void*)&searchContainer.object[0], 
-									    (void*)&(*static_cast<NGT::PersistentObject*>(neighborptr->second))[0], dimension);
+	NGT::Distance distance = NGT::PrimitiveComparator::L2Float::compare(searchContainer.object.getPointer(), 
+									    neighborptr->second->getPointer(), dimension);
 	NGT::ObjectDistance r;
 	r.set(neighborptr->first, distance);
-	if (distance <= explorationRadius) {
-	  unchecked.push(r);
-	  if (distance < top.distance) {
-	    discardedObjects.push(top);
-	    top = r;
-	    explorationRadius = searchContainer.explorationCoefficient * top.distance;
-	  } else {
-	    discardedObjects.push(r);
-	  }
+	untracedNodes.push(r);
+	if (distance < currentNearestBlob.distance) {
+	  discardedObjects.push(currentNearestBlob);
+	  currentNearestBlob = r;
+	  explorationRadius = searchContainer.blobExplorationCoefficient * currentNearestBlob.distance;
 	} else {
 	  discardedObjects.push(r);
 	}
@@ -623,7 +556,6 @@ namespace NGTLQG {
     }
 
     void load() {
-      struct stat st;
       if (quantizedBlobGraph.stat(path)) {
 	quantizedBlobGraph.load(path);
       } else {

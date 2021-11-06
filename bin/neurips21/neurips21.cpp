@@ -280,14 +280,13 @@ void gtRange(NGT::Args &args)
   }
   uint32_t numQueries;
   uint32_t totalRes;
-  uint32_t k;
   
   stream.read(reinterpret_cast<char*>(&numQueries), sizeof(numQueries));
   stream.read(reinterpret_cast<char*>(&totalRes), sizeof(totalRes));
   std::cerr << "# of queries=" << numQueries << std::endl;
   std::cerr << "totalRes=" << totalRes << std::endl;
 
-  std::vector<int32_t> numResultsPerQuery(numQueries);
+  std::vector<uint32_t> numResultsPerQuery(numQueries);
   for (size_t qidx = 0; qidx < numQueries; qidx++) {
     uint32_t v;
     stream.read(reinterpret_cast<char*>(&v), sizeof(v));
